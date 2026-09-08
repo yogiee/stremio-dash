@@ -11,3 +11,6 @@ __pycache__/
 
 # Deployment notes for my own homelab - never published
 NOTES.homelab.md
+
+# SSH credentials for deploy targets - never published
+.*-ssh

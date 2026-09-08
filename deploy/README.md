@@ -12,4 +12,9 @@ HOST=myserver DEST=/srv/stremio-dash ./install.sh
 Then edit `$DEST/config.json` on the target and `systemctl restart stremio-dash`.
 `install.sh` never overwrites an existing `config.json`.
 
-Requires root (for `nsenter` and the Docker CLI), Python 3.9+, and `ffprobe` on PATH.
+Requires Python 3.9+ on the target, and either root or passwordless sudo -- `nsenter`
+needs privileges and the unit file lands in `/etc/systemd/system`. `install.sh` escalates
+only where it has to, and leaves `$DEST` root-owned.
+
+`ffprobe` must exist **inside the Stremio container**, not on the host: the required-bitrate
+probe runs as `docker exec <container> ffprobe` against the container-local stream URL.
