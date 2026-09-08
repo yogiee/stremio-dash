@@ -38,7 +38,10 @@ offer a `docker-socket-proxy` restricted to containers/logs/exec as the hardened
 ## Phase 2 — probe backends and mode badging
 
 - Pluggable client/funnel probe: `nsenter` (on host) → sidecar (containerised) → none.
-- Detect the achieved mode at runtime and badge it in the UI.
+- ~~Detect the achieved mode at runtime and badge it in the UI.~~ **Done**, with the settings
+  popup: `/api/state` carries the achieved mode and the header and profile rows badge it.
+  It reports what was *achieved*, not what was configured — a bound container that is not
+  running reads A, not B.
 - Optional: approximate the runway in mode B from the container's aggregate `tx_bytes`
   (Docker stats API). **Measure before trusting** — it conflates clients and any seeding.
 

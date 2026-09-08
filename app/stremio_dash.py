@@ -212,6 +212,11 @@ def http_json(path, timeout=4):
                     raise
 
 
+def esc_html(t):
+    return (str(t).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def human_addr(a):
     """[::ffff:192.0.2.10]:49840 -> (192.0.2.10, 49840)"""
     a = a.strip()
@@ -997,10 +1002,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, body, ctype):
+    def _send(self, body, ctype, status=200):
         if isinstance(body, str):
             body = body.encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -1035,7 +1040,10 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/healthz":
             self._send("ok\n", "text/plain")
         elif p in ("/", "/index.html"):
-            self._send(PAGE, "text/html; charset=utf-8")
+            # 500 when the UI file is absent: a monitor polling / should not read a
+            # placeholder as a healthy dashboard.
+            self._send(PAGE, "text/html; charset=utf-8",
+                       200 if PAGE_OK else 500)
         else:
             self.send_error(404)
 
@@ -1163,233 +1171,51 @@ class Handler(BaseHTTPRequestHandler):
         return {"ok": True, "config": config_view()}
 
 
-PAGE = r"""<title>Stremio Server</title>
-<style>
-:root{--bg:#0e1116;--panel:#161b22;--panel2:#1c222b;--bd:#262d38;--fg:#e6edf3;--mut:#8b98a8;
---grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--pur:#bc8cff}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--bd);
-background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
-h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.2px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--grn);box-shadow:0 0 8px var(--grn)}
-.dot.bad{background:var(--red);box-shadow:0 0 8px var(--red)}
-.sub{color:var(--mut);font-size:12px}
-main{padding:18px 20px 60px;max-width:1200px;margin:0 auto}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
-.tile{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:12px 14px}
-.tile .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
-.tile .v{font-size:22px;font-weight:600;margin-top:3px}
-.tile .x{font-size:11px;color:var(--mut);margin-top:2px}
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
-.chead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.title{font-weight:600;font-size:15px;word-break:break-word}
-.badges{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap}
-.b{font-size:10px;font-weight:600;letter-spacing:.5px;padding:3px 8px;border-radius:20px;text-transform:uppercase}
-.b.on{background:rgba(63,185,80,.15);color:var(--grn);border:1px solid rgba(63,185,80,.3)}
-.b.pz{background:rgba(210,153,34,.15);color:var(--amb);border:1px solid rgba(210,153,34,.3)}
-.b.off{background:rgba(139,152,168,.12);color:var(--mut);border:1px solid var(--bd)}
-.b.sr{background:rgba(88,166,255,.13);color:var(--blu);border:1px solid rgba(88,166,255,.3)}
-.meta{color:var(--mut);font-size:12px;margin:6px 0 10px}
-.bar{position:relative;height:9px;background:var(--panel2);border-radius:5px;overflow:hidden;border:1px solid var(--bd)}
-.fill{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#1f6feb,#58a6ff);border-radius:5px}
-.ph{position:absolute;top:-3px;width:2px;height:15px;background:var(--pur);box-shadow:0 0 6px var(--pur)}
-.row{display:flex;gap:18px;align-items:center;margin-top:14px;flex-wrap:wrap}
-.speed{font-size:28px;font-weight:650;line-height:1}
-.speed small{font-size:12px;color:var(--mut);font-weight:400;margin-left:3px}
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
-.chip{background:var(--panel2);border:1px solid var(--bd);border-radius:7px;padding:5px 10px;font-size:12px}
-.chip b{font-weight:650}
-.chip span{color:var(--mut);font-size:11px;margin-right:5px}
-.verdict{margin-top:12px;padding:9px 12px;border-radius:8px;font-size:12.5px;border:1px solid}
-.v-ok{background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.3);color:#7ee787}
-.v-bad{background:rgba(248,81,73,.08);border-color:rgba(248,81,73,.3);color:#ff9a94}
-.v-idle{background:var(--panel2);border-color:var(--bd);color:var(--mut)}
-details{margin-top:12px;border-top:1px solid var(--bd);padding-top:10px}
-summary{cursor:pointer;color:var(--mut);font-size:12px;user-select:none}
-summary:hover{color:var(--fg)}
-table{width:100%;border-collapse:collapse;margin-top:9px;font-size:12px}
-th{text-align:left;color:var(--mut);font-weight:500;padding:4px 8px;border-bottom:1px solid var(--bd);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
-td{padding:4px 8px;border-bottom:1px solid rgba(38,45,56,.5)}
-tr:last-child td{border-bottom:0}
-.r{text-align:right}
-.mut{color:var(--mut)}
-.seed{color:var(--grn)}
-.err{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);color:#ff9a94;padding:10px 14px;border-radius:8px;margin-bottom:14px}
-.empty{color:var(--mut);text-align:center;padding:36px;border:1px dashed var(--bd);border-radius:12px}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);margin:22px 0 10px;font-weight:600}
-.foot{color:var(--mut);font-size:11px;margin-top:26px;line-height:1.7}
-</style>
-
-<header>
-  <div class="dot" id="dot"></div>
-  <h1>Stremio streaming server</h1>
-  <div class="sub" id="hdr"></div>
-</header>
-<main>
-  <div id="err"></div>
-  <div class="tiles" id="tiles"></div>
-  <div id="engines"></div>
-  <h2>Clients</h2>
-  <div id="clients"></div>
-  <div class="foot">
-    Read-only observer &mdash; polls <code>/stats.json</code>, the container socket table and the
-    container log. It is not in the media byte path.<br>
-    Swarm stats belong to the <em>engine</em> (one per infohash) and are shared if two devices play
-    the same title. <code>uploadSpeed</code> is not shown: the server mirrors it from
-    <code>downloadSpeed</code> and it is meaningless.
-  </div>
-</main>
-
-<script>
-const B=(n)=>{n=n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}
-  return n.toFixed(n<10&&i>0?2:i?1:0)+' '+u[i]};
-const S=(n)=>{n=n||0;return n<1024?n.toFixed(0)+' B/s':(n<1048576?(n/1024).toFixed(0)+' KB/s':(n/1048576).toFixed(2)+' MB/s')};
-const N=(n)=>(n||0).toLocaleString();
-const esc=(s)=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-
-function spark(a,w,h,col){
-  if(!a||a.length<2)return '';
-  const mx=Math.max(...a,1),n=a.length;
-  const pts=a.map((v,i)=>`${(i/(n-1)*w).toFixed(1)},${(h-(v/mx)*h).toFixed(1)}`).join(' ');
-  return `<svg width="${w}" height="${h}" style="display:block">
-    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.6"
-      stroke-linejoin="round" stroke-linecap="round"/>
-    <polyline points="0,${h} ${pts} ${w},${h}" fill="${col}" opacity=".12" stroke="none"/></svg>`;
-}
-
-function engineCard(e){
-  const prog=(e.progress==null?0:Math.min(e.progress,1));
-  const ph=e.playhead, phPct=(ph&&e.len)?Math.min(ph.offset/e.len,1)*100:null;
-  const active=!e.paused&&e.speed>0;
-  const badge=active?'<span class="b on">active</span>'
-    :(e.paused?'<span class="b pz">swarm paused</span>':'<span class="b off">idle</span>');
-  const search=e.searching?'<span class="b sr">peer search</span>':'';
-
-  let verdict='<div class="verdict v-idle">Idle &mdash; no bytes moving. Peer counts below are the '
-    +'engine holding its swarm open.</div>';
-  if(e.need_bps>0){
-    const head=e.speed-e.need_bps, ok=head>=0;
-    verdict=`<div class="verdict ${ok?'v-ok':'v-bad'}">Playback needs <b>${S(e.need_bps)}</b>,
-      swarm delivers <b>${S(e.speed)}</b> &mdash; ${ok?'keeping up':'short by <b>'+S(-head)+'</b>'}
-      ${ok?'':'&middot; expect buffering'}</div>`;
-  } else if(active){
-    verdict=`<div class="verdict v-ok">Downloading at <b>${S(e.speed)}</b>. Playback rate not
-      measured yet (needs ~30s of continuous play).</div>`;
-  }
-
-  const tr=(e.sources||[]).filter(s=>s.url).map(s=>{
-    const nm=s.url.replace(/^tracker:\/*/,'').replace(/^(udp|http|https):\/*/,'').split('/')[0];
-    const dead=(s.numFound||0)===0;
-    return `<tr><td class="${dead?'mut':''}">${esc(nm)}</td>
-      <td class="r num">${N(s.numFound)}</td><td class="r num">${N(s.numFoundUniq)}</td>
-      <td class="r num mut">${N(s.numRequests)}</td></tr>`}).join('');
-
-  const wr=(e.wires||[]).map(w=>`<tr>
-      <td class="num">${esc(w.ip||w.address)}</td>
-      <td class="mut">${esc((w.rdns||'').slice(0,42))}</td>
-      <td>${w.isSeeder?'<span class="seed">seed</span>':'<span class="mut">peer</span>'}</td>
-      <td class="r num">${S(w.downSpeed)}</td>
-      <td class="r num mut">${S(w.upSpeed)}</td>
-      <td class="r num mut">${N(w.requests)}</td></tr>`).join('');
-
-  return `<div class="card">
-    <div class="chead">
-      <div class="title">${esc(e.name)}</div>
-      <div class="badges">${search}${badge}</div>
-    </div>
-    <div class="meta">
-      ${B(e.len)} &middot; ${(prog*100).toFixed(1)}% cached &middot; ${B(e.downloaded)} downloaded
-      ${phPct!=null?` &middot; <span style="color:var(--pur)">playhead ${phPct.toFixed(1)}%</span>`:''}
-      ${ph&&ph.seeks?` &middot; ${ph.seeks} seek${ph.seeks>1?'s':''}`:''}
-      &middot; <span class="num" style="opacity:.5">${esc(e.infohash.slice(0,12))}</span>
-    </div>
-    <div class="bar"><div class="fill" style="width:${(prog*100).toFixed(2)}%"></div>
-      ${phPct!=null?`<div class="ph" style="left:${phPct.toFixed(2)}%"></div>`:''}</div>
-    <div class="row">
-      <div><div class="speed num">${S(e.speed)}</div>
-        <div class="sub" style="margin-top:3px">swarm ingest</div></div>
-      <div style="width:150px">${spark(e.spark,150,34,'#58a6ff')}</div>
-      <div class="chips">
-        <div class="chip"><span>connected</span><b class="num">${e.peers}</b></div>
-        <div class="chip"><span>unchoked</span><b class="num" style="color:${e.unchoked?'var(--grn)':'var(--red)'}">${e.unchoked}</b></div>
-        <div class="chip"><span>queued</span><b class="num">${N(e.queued)}</b></div>
-        <div class="chip"><span>known</span><b class="num">${N(e.unique)}</b></div>
-        <div class="chip"><span>swarm</span><b class="num">${e.swarm_conn}/${e.swarm}</b></div>
-        <div class="chip"><span>dial attempts</span><b class="num">${N(e.tries)}</b></div>
-      </div>
-    </div>
-    ${verdict}
-    <details${(e.wires||[]).length?' open':''}>
-      <summary>Peers &mdash; ${(e.wires||[]).length} wire(s) of ${N(e.unique)} known</summary>
-      ${wr?`<table><tr><th>Address</th><th>Reverse DNS</th><th></th><th class="r">Down</th>
-        <th class="r">Up</th><th class="r">Req</th></tr>${wr}</table>`
-        :'<div class="mut" style="padding:8px 0;font-size:12px">No wires held right now.</div>'}
-    </details>
-    <details><summary>Trackers &mdash; ${(e.sources||[]).length}</summary>
-      <table><tr><th>Tracker</th><th class="r">Found</th><th class="r">Unique</th>
-        <th class="r">Announces</th></tr>${tr}</table></details>
-  </div>`;
-}
-
-async function tick(){
-  let d;
-  try{ d=await (await fetch('/api/state',{cache:'no-store'})).json(); }
-  catch(e){ document.getElementById('dot').className='dot bad'; return; }
-
-  document.getElementById('dot').className='dot'+(d.ok?'':' bad');
-  const age=d.ts?Math.round(Date.now()/1000-d.ts):0;
-  document.getElementById('hdr').textContent=
-    `v${d.server_version||'?'} · updated ${age}s ago`;
-  document.getElementById('err').innerHTML=d.error?`<div class="err">${esc(d.error)}</div>`:'';
-
-  const es=Object.values(d.engines||{}).sort((a,b)=>b.speed-a.speed);
-  const tot=es.reduce((s,e)=>s+(e.speed||0),0);
-  const f=d.funnel||{}, cl=(d.clients||[]).filter(c=>c.state==='ESTAB');
-  const cache=d.cache||{};
-  document.getElementById('tiles').innerHTML=`
-    <div class="tile"><div class="k">Total ingest</div><div class="v num">${S(tot)}</div>
-      <div class="x">${es.length} engine${es.length===1?'':'s'} loaded</div></div>
-    <div class="tile"><div class="k">Clients</div><div class="v num">${cl.length}</div>
-      <div class="x">${esc(cl.map(c=>c.name||c.ip).join(', ')||'none connected')}</div></div>
-    <div class="tile"><div class="k">Peer dial funnel</div>
-      <div class="v num">${f.established||0} <span style="color:var(--mut);font-size:14px">/ ${(f.established||0)+(f.dialing||0)}</span></div>
-      <div class="x">${((f.hit_rate||0)*100).toFixed(1)}% of dials connect &middot; ${f.dialing||0} in flight</div></div>
-    <div class="tile"><div class="k">Cache</div><div class="v num">${cache.bytes!=null?B(cache.bytes):'—'}</div>
-      <div class="x">${cache.entries!=null?cache.entries+' entries':(cache.error?'unreadable':'measuring…')}</div></div>`;
-
-  document.getElementById('engines').innerHTML=es.length?es.map(engineCard).join('')
-    :'<div class="empty">No active engines. Start playing something in Stremio.</div>';
-
-  document.getElementById('clients').innerHTML=(d.clients||[]).length?
-    `<div class="card" style="padding:8px 16px 14px"><table>
-      <tr><th>Client</th><th>Address</th><th>Port</th><th class="r">Delivered rate</th>
-      <th class="r">Total sent</th><th class="r">RTT</th><th>State</th></tr>`+
-    d.clients.map(c=>`<tr>
-      <td>${esc(c.name||'—')}</td><td class="num">${esc(c.ip)}</td>
-      <td class="num mut">${c.via}</td>
-      <td class="r num">${S(c.delivered_bps)}</td>
-      <td class="r num mut">${B(c.bytes_acked)}</td>
-      <td class="r num mut">${esc(c.rtt||'—')}ms</td>
-      <td>${c.stalled?'<span style="color:var(--amb)">paused / not reading</span>':
-        (c.state==='ESTAB'?'<span class="seed">streaming</span>':esc(c.state))}</td></tr>`).join('')
-    +'</table></div>'
-    :'<div class="empty">No client connected to :11470 / :12470.</div>';
-}
-tick(); setInterval(tick,2000);
-</script>
-"""
-
-
-# page.html next to this file wins over the embedded copy, so the UI can be
-# edited and redeployed without rebuilding this module.
+# ------------------------------------------------------------------- ui
+# page.html sits next to this module and IS the interface. It is read once at import,
+# so the UI can be edited and redeployed without touching this file.
+#
+# A full copy of the UI used to live here as a fallback. It drifted silently: by the
+# time the settings popup landed, the embedded copy was serving a dashboard several
+# features behind with no way to tell from the browser. A stale UI presented as the
+# real one is exactly the sort of unsupported claim this project refuses to make
+# elsewhere, so a missing page.html now says so instead of quietly substituting.
 _PF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page.html")
-if os.path.exists(_PF):
+
+
+def load_page():
+    """-> (html, ok). ok is False when the placeholder is being served."""
     try:
-        PAGE = open(_PF, encoding="utf-8").read()
-    except Exception:
-        pass
+        with open(_PF, encoding="utf-8") as fh:
+            return fh.read(), True
+    except Exception as exc:
+        print(f"page.html unreadable ({exc}); serving the placeholder", flush=True)
+        return f"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>stremio-dash - UI missing</title>
+<style>body{{margin:0;background:#0e1116;color:#e6edf3;padding:40px 22px;
+font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
+main{{max-width:640px;margin:0 auto}}
+code{{background:#1c222b;border:1px solid #262d38;border-radius:5px;padding:1px 5px;
+font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}}
+.e{{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);color:#ff9a94;
+padding:11px 14px;border-radius:8px;margin:0 0 18px}}
+.m{{color:#8b98a8;font-size:13px}}</style>
+<main>
+<div class="e"><b>page.html is missing.</b> The dashboard UI is a separate file and
+this process could not read it.</div>
+<p>It should sit next to <code>stremio_dash.py</code>:<br><code>{esc_html(_PF)}</code></p>
+<p class="m">Copy it from the repo, or re-run <code>deploy/install.sh</code>, which ships
+both files. The collector itself is unaffected and still running &mdash; the JSON API is
+live at <code>/api/state</code>, and <code>/healthz</code> still answers.</p>
+<p class="m">There is deliberately no built-in copy of the UI: an embedded fallback drifted
+out of date and served an old dashboard without saying so.</p>
+</main>
+""", False
+
+
+PAGE, PAGE_OK = load_page()
 
 
 if __name__ == "__main__":
