@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Stremio Server</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--panel2:#1c222b;--bd:#262d38;--fg:#e6edf3;--mut:#8b98a8;
+--grn:#3fb950;--amb:#d29922;--red:#f85149;--blu:#58a6ff;--pur:#bc8cff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--bd);
+background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.2px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--grn);box-shadow:0 0 8px var(--grn)}
+.dot.bad{background:var(--red);box-shadow:0 0 8px var(--red)}
+.sub{color:var(--mut);font-size:12px}
+main{padding:18px 20px 60px;max-width:1200px;margin:0 auto}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.tile{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:12px 14px}
+.tile .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
+.tile .v{font-size:22px;font-weight:600;margin-top:3px}
+.tile .x{font-size:11px;color:var(--mut);margin-top:2px}
+.card{background:var(--panel);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
+.chead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.title{font-weight:600;font-size:15px;word-break:break-word}
+.badges{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap}
+.b{font-size:10px;font-weight:600;letter-spacing:.5px;padding:3px 8px;border-radius:20px;text-transform:uppercase}
+.b.on{background:rgba(63,185,80,.15);color:var(--grn);border:1px solid rgba(63,185,80,.3)}
+.b.pz{background:rgba(210,153,34,.15);color:var(--amb);border:1px solid rgba(210,153,34,.3)}
+.b.off{background:rgba(139,152,168,.12);color:var(--mut);border:1px solid var(--bd)}
+.b.sr{background:rgba(88,166,255,.13);color:var(--blu);border:1px solid rgba(88,166,255,.3)}
+.meta{color:var(--mut);font-size:12px;margin:6px 0 10px}
+.bar{position:relative;height:9px;background:var(--panel2);border-radius:5px;overflow:hidden;border:1px solid var(--bd)}
+.fill{position:absolute;inset:0 auto 0 0;background:linear-gradient(90deg,#1f6feb,#58a6ff);border-radius:5px}
+.ph{position:absolute;top:-3px;width:2px;height:15px;background:var(--pur);box-shadow:0 0 6px var(--pur)}
+.row{display:flex;gap:18px;align-items:center;margin-top:14px;flex-wrap:wrap}
+.speed{font-size:28px;font-weight:650;line-height:1}
+.speed small{font-size:12px;color:var(--mut);font-weight:400;margin-left:3px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+.chip{background:var(--panel2);border:1px solid var(--bd);border-radius:7px;padding:5px 10px;font-size:12px}
+.chip b{font-weight:650}
+.chip span{color:var(--mut);font-size:11px;margin-right:5px}
+.verdict{margin-top:12px;padding:9px 12px;border-radius:8px;font-size:12.5px;border:1px solid}
+.v-ok{background:rgba(63,185,80,.08);border-color:rgba(63,185,80,.3);color:#7ee787}
+.v-bad{background:rgba(248,81,73,.08);border-color:rgba(248,81,73,.3);color:#ff9a94}
+.v-warn{background:rgba(210,153,34,.08);border-color:rgba(210,153,34,.35);color:#e3b341}
+.v-idle{background:var(--panel2);border-color:var(--bd);color:var(--mut)}
+details{margin-top:12px;border-top:1px solid var(--bd);padding-top:10px}
+summary{cursor:pointer;color:var(--mut);font-size:12px;user-select:none}
+summary:hover{color:var(--fg)}
+table{width:100%;border-collapse:collapse;margin-top:9px;font-size:12px}
+th{text-align:left;color:var(--mut);font-weight:500;padding:4px 8px;border-bottom:1px solid var(--bd);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+td{padding:4px 8px;border-bottom:1px solid rgba(38,45,56,.5)}
+tr:last-child td{border-bottom:0}
+.r{text-align:right}
+.mut{color:var(--mut)}
+.seed{color:var(--grn)}
+.err{background:rgba(248,81,73,.1);border:1px solid rgba(248,81,73,.3);color:#ff9a94;padding:10px 14px;border-radius:8px;margin-bottom:14px}
+.empty{color:var(--mut);text-align:center;padding:36px;border:1px dashed var(--bd);border-radius:12px}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);margin:22px 0 10px;font-weight:600}
+.foot{color:var(--mut);font-size:11px;margin-top:26px;line-height:1.7}
+.sparkbox{width:150px;flex:0 0 auto}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.tw table{min-width:420px}
+@media (max-width:700px){
+  header{padding:11px 14px;gap:9px}
+  h1{font-size:14px}
+  main{padding:14px 12px 44px}
+  .tiles{grid-template-columns:repeat(2,1fr);gap:9px;margin-bottom:14px}
+  .tile{padding:10px 11px}
+  .tile .v{font-size:19px}
+  .tile .x{font-size:10px}
+  .card{padding:13px;border-radius:10px}
+  .title{font-size:14px}
+  .meta{font-size:11.5px}
+  .row{gap:11px;align-items:stretch;flex-direction:column}
+  .speed{font-size:24px}
+  .sparkbox{width:100%}
+  .chips{margin-left:0;gap:6px}
+  .chip{padding:4px 8px;font-size:11px}
+  .chip span{font-size:10px}
+  .verdict{font-size:12px;padding:8px 10px}
+  summary{padding:7px 0}          /* bigger touch target */
+  .sm-hide{display:none}
+  .tw table{min-width:0}
+  td,th{padding:5px 6px}
+  .foot{font-size:10.5px}
+}
+@media (max-width:380px){ .tiles{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>Stremio streaming server</h1>
+  <div class="sub" id="hdr"></div>
+</header>
+<main>
+  <div id="err"></div>
+  <div class="tiles" id="tiles"></div>
+  <div id="engines"></div>
+  <div class="empty" id="empty" hidden>No active engines. Start playing something in Stremio.</div>
+  <h2>Clients</h2>
+  <div id="clients"></div>
+  <div class="foot">
+    Read-only observer &mdash; polls <code>/stats.json</code>, the container socket table and the
+    container log. It is not in the media byte path.<br>
+    Swarm stats belong to the <em>engine</em> (one per infohash) and are shared if two devices play
+    the same title. <code>uploadSpeed</code> is not shown: the server mirrors it from
+    <code>downloadSpeed</code> and it is meaningless.
+  </div>
+</main>
+
+<script>
+const B=(n)=>{n=n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}
+  return n.toFixed(n<10&&i>0?2:i?1:0)+' '+u[i]};
+const S=(n)=>{n=n||0;return n<1024?n.toFixed(0)+' B/s':(n<1048576?(n/1024).toFixed(0)+' KB/s':(n/1048576).toFixed(2)+' MB/s')};
+const N=(n)=>(n||0).toLocaleString();
+const esc=(s)=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function spark(a,w,h,col){
+  if(!a||a.length<2)return '';
+  const mx=Math.max(...a,1),n=a.length;
+  const pts=a.map((v,i)=>`${(i/(n-1)*w).toFixed(1)},${(h-(v/mx)*h).toFixed(1)}`).join(' ');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" width="100%" height="${h}"
+      style="display:block">
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.6"
+      stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+    <polyline points="0,${h} ${pts} ${w},${h}" fill="${col}" opacity=".12" stroke="none"/></svg>`;
+}
+
+/* Panels are user-controlled and never toggled by an update. The choice is held
+   per panel type (not per infohash) for the life of the page, so it survives every
+   tick and any card rebuild; a reload starts collapsed. Deliberately NOT stored in
+   the browser: a `<details open>` built via innerHTML emits a spurious `toggle` on
+   insertion, which made a saved preference flip itself back off. Collapsed panels
+   are not rendered at all. */
+const PREF = {};
+
+const cards = new Map();          // infohash -> {el, refs, details}
+let LAST = null;                  // most recent /api/state payload
+
+const skeleton = () => `
+  <div class="chead">
+    <div class="title" data-r="name"></div>
+    <div class="badges" data-r="badges"></div>
+  </div>
+  <div class="meta" data-r="meta"></div>
+  <div class="bar"><div class="fill" data-r="fill"></div><div class="ph" data-r="ph" hidden></div></div>
+  <div class="row">
+    <div><div class="speed num" data-r="speed"></div>
+      <div class="sub" style="margin-top:3px">swarm ingest</div></div>
+    <div class="sparkbox" data-r="spark"></div>
+    <div class="chips" data-r="chips"></div>
+  </div>
+  <div data-r="verdict"></div>
+  <details data-k="peers"${PREF.peers?' open':''}><summary data-r="psum"></summary><div data-r="ptab"></div></details>
+  <details data-k="trackers"${PREF.trackers?' open':''}><summary data-r="tsum"></summary><div data-r="ttab"></div></details>`;
+
+function peerTable(e){
+  if(!(e.wires||[]).length)
+    return '<div class="mut" style="padding:8px 0;font-size:12px">No wires held right now.</div>';
+  return `<div class="tw"><table><tr><th>Address</th><th>Type</th><th class="r">Down</th>
+      <th class="r">Up</th><th class="r sm-hide">Req</th></tr>`+
+    e.wires.map(w=>`<tr>
+      <td class="num">${esc(w.ip||w.address)}${w.rdns?` <span class="mut sm-hide">${esc(w.rdns.slice(0,38))}</span>`:''}</td>
+      <td>${w.isSeeder?'<span class="seed">seed</span>':'<span class="mut">peer</span>'}</td>
+      <td class="r num">${S(w.downSpeed)}</td>
+      <td class="r num mut">${S(w.upSpeed)}</td>
+      <td class="r num mut sm-hide">${N(w.requests)}</td></tr>`).join('')+'</table></div>';
+}
+
+function trackerTable(e){
+  const rows=(e.sources||[]).filter(s=>s.url).map(s=>{
+    const nm=s.url.replace(/^tracker:\/*/,'').replace(/^(udp|http|https):\/*/,'').split('/')[0];
+    return `<tr><td class="${(s.numFound||0)===0?'mut':''}">${esc(nm)}</td>
+      <td class="r num">${N(s.numFound)}</td><td class="r num">${N(s.numFoundUniq)}</td>
+      <td class="r num mut sm-hide">${N(s.numRequests)}</td></tr>`}).join('');
+  return `<div class="tw"><table><tr><th>Tracker</th><th class="r">Found</th><th class="r">Unique</th>
+    <th class="r sm-hide">Announces</th></tr>${rows}</table></div>`;
+}
+
+/* Only an OPEN panel gets its body built. A collapsed one is emptied once and
+   then skipped entirely on every subsequent tick. */
+function paintPanels(ih){
+  const c=cards.get(ih); if(!c) return;
+  const e=(LAST&&LAST.engines)?LAST.engines[ih]:null; if(!e) return;
+  for(const [k,fn,slot] of [['peers',peerTable,'ptab'],['trackers',trackerTable,'ttab']]){
+    const open=c.details[k].open;
+    if(open) c.refs[slot].innerHTML=fn(e);
+    else if(c.refs[slot].innerHTML) c.refs[slot].innerHTML='';
+  }
+}
+
+function makeCard(ih){
+  const el=document.createElement('div');
+  el.className='card'; el.dataset.ih=ih; el.innerHTML=skeleton();
+  const refs={}; el.querySelectorAll('[data-r]').forEach(n=>refs[n.dataset.r]=n);
+  const details={};
+  el.querySelectorAll('details[data-k]').forEach(d=>{
+    const k=d.dataset.k; details[k]=d;   // open state already in the markup
+    // `toggle` also fires for changes we did not ask for (notably at insertion),
+    // so only a real gesture on the summary updates the remembered state.
+    let gesture=false;
+    d.querySelector('summary').addEventListener('click',()=>{ gesture=true; });
+    d.addEventListener('toggle',()=>{
+      if(gesture){ PREF[k]=d.open; gesture=false; }   // only a real gesture counts
+      paintPanels(ih);
+    });
+  });
+  const c={el,refs,details}; cards.set(ih,c);
+  document.getElementById('engines').appendChild(el);
+  return c;
+}
+
+function updateCard(e){
+  const c=cards.get(e.infohash)||makeCard(e.infohash);
+  const r=c.refs;
+  const prog=(e.progress==null?0:Math.min(e.progress,1));
+  const ph=e.playhead, phPct=(ph&&e.len)?Math.min(ph.offset/e.len,1)*100:null;
+  const active=!e.paused&&e.speed>0;
+  const serving=e.consumers>0;
+
+  r.name.textContent=e.name;
+  r.badges.innerHTML=(e.searching?'<span class="b sr">peer search</span>':'')+
+    (serving&&!active?'<span class="b on">from cache</span>'
+      :(active?'<span class="b on">active</span>'
+          :(e.paused?'<span class="b pz">swarm paused</span>':'<span class="b off">idle</span>')));
+  r.meta.innerHTML=`${B(e.len)} &middot; ${(prog*100).toFixed(1)}% cached &middot; ${B(e.downloaded)} downloaded`
+    +(e.required_bps?` &middot; needs ${S(e.required_bps)}`:'')
+    +(phPct!=null?` &middot; <span style="color:var(--pur)">playhead ${phPct.toFixed(1)}%</span>`:'')
+    +(ph&&ph.seeks?` &middot; ${ph.seeks} seek${ph.seeks>1?'s':''}`:'')
+    +` &middot; <span class="num" style="opacity:.5">${esc(e.infohash.slice(0,12))}</span>`;
+  r.fill.style.width=(prog*100).toFixed(2)+'%';
+  r.ph.hidden=(phPct==null);
+  if(phPct!=null) r.ph.style.left=phPct.toFixed(2)+'%';
+  r.speed.textContent=S(e.speed);
+  r.spark.innerHTML=spark(e.spark,150,34,'#58a6ff');
+  r.chips.innerHTML=`
+    <div class="chip"><span>connected</span><b class="num">${e.peers}</b></div>
+    <div class="chip"><span>unchoked</span><b class="num" style="color:${e.unchoked?'var(--grn)':'var(--red)'}">${e.unchoked}</b></div>
+    <div class="chip"><span>queued</span><b class="num">${N(e.queued)}</b></div>
+    <div class="chip"><span>known</span><b class="num">${N(e.unique)}</b></div>
+    <div class="chip"><span>swarm</span><b class="num">${e.swarm_conn}/${e.swarm}</b></div>
+    <div class="chip"><span>dial attempts</span><b class="num">${N(e.tries)}</b></div>`;
+
+  // The real requirement comes from ffprobe (file bitrate) — not from the client's
+  // delivered rate, which is circular for an uncached title (it can only receive as
+  // fast as the swarm supplies, so it would always read "keeping up" while buffering).
+  const need=e.required_bps||0;
+  if(e.cached && e.consumers>0){
+    r.verdict.innerHTML=`<div class="verdict v-ok">Fully cached &mdash; served from disk at
+      <b>${S(e.demand_bps)}</b> to ${e.consumers} client${e.consumers>1?'s':''}. No peers needed;
+      the swarm numbers below are just the engine holding its position.</div>`;
+  } else if(e.cached && !e.attributable && e.any_consumers){
+    r.verdict.innerHTML='<div class="verdict v-ok">Fully cached &mdash; no swarm traffic needed. '
+      +'A client is reading, but with more than one engine loaded it cannot be tied to this '
+      +'title.</div>';
+  } else if(e.cached){
+    r.verdict.innerHTML='<div class="verdict v-idle">Fully cached and nobody is reading it. '
+      +'Swarm is idle.</div>';
+  } else if(need>0 && (active||e.being_read)){
+    const head=e.speed-need, rw=e.runway_secs, buf=e.buffered_secs;
+    const lead=`Playback needs <b>${S(need)}</b>, swarm delivers <b>${S(e.speed)}</b>`;
+    const banked=buf?` &middot; <b>${dur(buf)}</b> banked ahead of the playhead`:'';
+    if(head>=0){
+      r.verdict.innerHTML=`<div class="verdict v-ok">${lead} &mdash;
+        keeping up, ${(e.speed/need).toFixed(1)}&times; headroom${banked}</div>`;
+    } else if(rw===-1){
+      r.verdict.innerHTML=`<div class="verdict v-ok">${lead} &mdash; slower than real time, but the
+        whole file is already in hand. No buffering.</div>`;
+    } else if(rw==null){
+      // No usable position fix, so runway is genuinely unknown - say so rather than
+      // claiming a stall that the cache may well absorb.
+      r.verdict.innerHTML=`<div class="verdict v-warn">${lead} &mdash; short by
+        <b>${S(-head)}</b>. Buffer ahead of the playhead is unknown, so this may or may
+        not stall.</div>`;
+    } else if(rw > 600){
+      r.verdict.innerHTML=`<div class="verdict v-ok">${lead} &mdash; slower than real time, but
+        <b>${dur(buf)}</b> is banked. Comfortable for about <b>${dur(rw)}</b> at this rate.</div>`;
+    } else if(rw > 120){
+      r.verdict.innerHTML=`<div class="verdict v-warn">${lead} &mdash; short by <b>${S(-head)}</b>.
+        <b>${dur(buf)}</b> banked, so the buffer runs out in about <b>${dur(rw)}</b> unless the
+        swarm picks up.</div>`;
+    } else {
+      r.verdict.innerHTML=`<div class="verdict v-bad">${lead} &mdash; short by <b>${S(-head)}</b>
+        and only <b>${dur(buf)}</b> banked. Buffering within <b>${dur(rw)}</b>.</div>`;
+    }
+  } else if(need>0 && !active){
+    r.verdict.innerHTML=`<div class="verdict v-idle">Idle. This title needs <b>${S(need)}</b>
+      for real-time playback.</div>`;
+  } else if(active){
+    r.verdict.innerHTML=`<div class="verdict v-ok">Downloading at <b>${S(e.speed)}</b>. Playback rate
+      not measurable yet &mdash; needs ~30s of the player advancing through the file.</div>`;
+  } else {
+    r.verdict.innerHTML='<div class="verdict v-idle">Idle &mdash; no bytes moving. Peer counts above are '
+      +'the engine holding its swarm open.</div>';
+  }
+
+  // Counts stay live even while collapsed; only the tables are gated.
+  r.psum.textContent=`Peers — ${(e.wires||[]).length} wire(s) of ${N(e.unique)} known`;
+  r.tsum.textContent=`Trackers — ${(e.sources||[]).length}`;
+  paintPanels(e.infohash);
+}
+
+const dur=(s)=>{s=Math.round(s||0);return s<60?s+'s':(s<3600?Math.round(s/60)+' min':(s/3600).toFixed(1)+' hr')};
+/* The server is never told play/pause — it is a plain byte server. So activity is
+   inferred from whether the client is still taking bytes, over a window wide enough
+   to span one buffer-refill burst. A fully cached file needs no peers, so "no swarm
+   traffic" is not the same as "not playing". */
+function clientState(c){
+  if(c.state!=='ESTAB') return esc(c.state);
+  if(!c.active) return `<span class="mut">idle ${dur(c.idle_for)}</span>`;
+  return c.from_cache ? '<span class="seed">streaming <span class="mut">from cache</span></span>'
+                      : '<span class="seed">streaming</span>';
+}
+const setHTML=(el,html)=>{ if(el.innerHTML!==html) el.innerHTML=html; };
+
+async function tick(){
+  let d;
+  try{ d=await (await fetch('/api/state',{cache:'no-store'})).json(); }
+  catch(e){ document.getElementById('dot').className='dot bad'; return; }
+  LAST=d;
+
+  document.getElementById('dot').className='dot'+(d.ok?'':' bad');
+  document.getElementById('hdr').textContent=
+    `v${d.server_version||'?'} · updated ${d.ts?Math.round(Date.now()/1000-d.ts):0}s ago`;
+  setHTML(document.getElementById('err'), d.error?`<div class="err">${esc(d.error)}</div>`:'');
+
+  const engines=d.engines||{}, es=Object.values(engines);
+  const tot=es.reduce((s,e)=>s+(e.speed||0),0);
+  const f=d.funnel||{}, cl=(d.clients||[]).filter(c=>c.state==='ESTAB'), cache=d.cache||{};
+  const cap=(d.settings||{}).cacheSize||0;
+  setHTML(document.getElementById('tiles'),`
+    <div class="tile"><div class="k">Total ingest</div><div class="v num">${S(tot)}</div>
+      <div class="x">${es.length} engine${es.length===1?'':'s'} loaded</div></div>
+    <div class="tile"><div class="k">Clients</div><div class="v num">${cl.length}</div>
+      <div class="x">${esc(cl.map(c=>c.name||c.ip).join(', ')||'none connected')}</div></div>
+    <div class="tile"><div class="k">Peer dial funnel</div>
+      <div class="v num">${f.established||0} <span style="color:var(--mut);font-size:14px">/ ${(f.established||0)+(f.dialing||0)}</span></div>
+      <div class="x">${((f.hit_rate||0)*100).toFixed(1)}% of dials connect &middot; ${f.dialing||0} dialing now</div></div>
+    <div class="tile"><div class="k">Cache</div>
+      <div class="v num">${cache.bytes!=null?B(cache.bytes):'—'}${cap?`<span style="color:var(--mut);font-size:14px"> / ${B(cap)}</span>`:''}</div>
+      <div class="x">${cache.entries!=null?`${cache.entries} cached${cap?` &middot; ${(100*cache.bytes/cap).toFixed(0)}% of cap`:''}`
+        :(cache.error?'unreadable':'measuring…')}</div></div>`);
+
+  // Cards are updated in place and kept in first-seen order: nothing is destroyed
+  // or reordered underneath the user while they are reading it.
+  for(const ih of [...cards.keys()]) if(!engines[ih]){ cards.get(ih).el.remove(); cards.delete(ih); }
+  for(const e of es) updateCard(e);
+
+  const empty=document.getElementById('empty');
+  empty.hidden=es.length>0;
+
+  setHTML(document.getElementById('clients'), (d.clients||[]).length?
+    `<div class="card" style="padding:8px 12px 14px"><div class="tw"><table>
+      <tr><th>Client</th><th>Address</th><th class="sm-hide">Port</th><th class="r">Delivered <span class="mut">avg</span></th>
+      <th class="r">Total sent</th><th class="r sm-hide">RTT</th><th>State</th></tr>`+
+    d.clients.map(c=>`<tr>
+      <td>${esc(c.name||'—')}</td><td class="num">${esc(c.ip)}</td>
+      <td class="num mut sm-hide">${c.via}</td>
+      <td class="r num">${S(c.delivered_bps)}</td>
+      <td class="r num mut">${B(c.bytes_acked)}</td>
+      <td class="r num mut sm-hide">${esc(c.rtt||'—')}ms</td>
+      <td>${clientState(c)}</td></tr>`).join('')
+    +'</table></div></div>'
+    :'<div class="empty">No client connected to :11470 / :12470.</div>');
+}
+tick(); setInterval(tick,2000);
+</script>
+</body>
+</html>

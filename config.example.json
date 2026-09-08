@@ -1,0 +1,19 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 9481 },
+  "poll": { "interval_sec": 2.0, "detail_sec": 6.0, "settings_sec": 60.0, "history": 180 },
+  "rdns": true,
+  "active": "local",
+  "servers": [
+    {
+      "id": "local",
+      "name": "Stremio",
+      "url": "http://127.0.0.1:11470",
+      "container": "stremio-docker",
+      "cache_dir": null,
+      "client_names": {
+        "192.0.2.10": "Living room TV",
+        "192.0.2.11": "Tablet"
+      }
+    }
+  ]
+}

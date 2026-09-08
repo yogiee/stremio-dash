@@ -1,0 +1,13 @@
+# Real deployment config: contains LAN addresses and device names
+config.json
+*.local.json
+
+# Backups and scratch
+*.bak
+*.bak-*
+__pycache__/
+*.pyc
+.DS_Store
+
+# Deployment notes for my own homelab - never published
+NOTES.homelab.md
