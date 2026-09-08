@@ -42,14 +42,25 @@ offer a `docker-socket-proxy` restricted to containers/logs/exec as the hardened
 - Optional: approximate the runway in mode B from the container's aggregate `tx_bytes`
   (Docker stats API). **Measure before trusting** — it conflates clients and any seeding.
 
-## Phase 3 — settings popup
+## Phase 3 — settings popup  *(done)*
 
-- `config.json` gains hot reload (currently read once at startup).
-- `GET/POST /api/config`, `POST /api/servers/{id}/test` (report achieved mode),
-  `POST /api/active`.
-- Gear icon → modal: profile list with mode badge and reachability dot, radio to switch,
-  add/edit/delete, Test button. Edits names/URLs/client-names only.
-- `client_names` is per profile — different servers, different LANs.
+Gear icon → modal: profile list with a live mode badge, switch, add, delete, and a Test
+button; auto-detected Stremio containers offered from `docker ps`; a free-text URL field
+for a server anywhere on the network. `GET /api/config`, `GET /api/discover`,
+`POST /api/test`, `POST /api/servers`, `POST /api/servers/{id}[/test|/delete]`,
+`POST /api/active`. The active profile is switched in place — no restart — and every
+derived signal (history, playhead, sockets, bitrates) is dropped on switch, because that
+state describes one server and would otherwise be shown under another's name.
+
+Two things fell out of it and are now settled:
+
+| decision | choice | why |
+|---|---|---|
+| Container binding from the UI | **closed vocabulary only** | the settled rule was "no Docker endpoints from the UI", to stop an unauthenticated LAN user reaching `docker exec`. The popup still needs to offer the container it found, so the client sends an **id from the server's own `docker ps`**, re-validated at write time. A container name is never taken as free text. URLs stay free text — they only reach `http.client` |
+| ffprobe in mode A | **fall back to host ffprobe** | `docs/modes.md` always claimed the bitrate verdict worked over plain HTTP, but the code only ever ran `docker exec <container> ffprobe`, so a remote profile silently had no verdict at all. It now execs in the container when one is bound and uses host ffprobe otherwise |
+
+Still file-only, deliberately: Docker socket paths, `cache_dir`, poll intervals.
+`client_names` editing is wired in the API (`POST /api/servers/{id}`) but has no UI yet.
 
 ## Phase 4 — publish
 

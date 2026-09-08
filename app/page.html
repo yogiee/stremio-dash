@@ -66,7 +66,47 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
 .sparkbox{width:150px;flex:0 0 auto}
 .tw{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .tw table{min-width:420px}
+.b.bad{background:rgba(248,81,73,.14);color:#ff9a94;border:1px solid rgba(248,81,73,.35)}
+/* --- settings popup --- */
+.gear{margin-left:auto;background:var(--panel2);border:1px solid var(--bd);color:var(--mut);
+  width:32px;height:32px;border-radius:8px;font-size:15px;cursor:pointer;line-height:1;flex:0 0 auto}
+.gear:hover{color:var(--fg);border-color:var(--blu)}
+.ovl{position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:20;overflow:auto;
+  display:flex;align-items:flex-start;justify-content:center;padding:36px 14px}
+/* display:flex above outranks the UA rule for [hidden], so say it explicitly or the
+   popup is open on load. */
+.ovl[hidden]{display:none}
+.modal{background:var(--panel);border:1px solid var(--bd);border-radius:12px;
+  width:100%;max-width:660px;padding:16px 18px 18px}
+.mhead{display:flex;align-items:center;gap:10px}
+.mhead h2{margin:0;font-size:13px;color:var(--fg)}
+.msec{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
+  margin:18px 0 6px;font-weight:600}
+.srv{display:flex;gap:10px;align-items:flex-start;padding:9px 11px;border:1px solid var(--bd);
+  border-radius:9px;margin-top:7px;background:var(--panel2)}
+.srv.act{border-color:rgba(88,166,255,.5);background:rgba(88,166,255,.07)}
+.srv .who{flex:1;min-width:0}
+.srv .nm{font-weight:600;font-size:13px;word-break:break-word}
+.srv .ur{font-size:11.5px;color:var(--mut);word-break:break-all;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.srv .acts{display:flex;gap:6px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+.fld{width:100%;background:var(--bg);border:1px solid var(--bd);color:var(--fg);
+  border-radius:7px;padding:8px 10px;font-size:13px;margin-top:7px;font-family:inherit}
+.fld:focus{outline:none;border-color:var(--blu)}
+.btn{background:var(--panel2);border:1px solid var(--bd);color:var(--fg);border-radius:7px;
+  padding:6px 11px;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--blu)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.pri{background:rgba(88,166,255,.16);border-color:rgba(88,166,255,.45);color:#9ecbff}
+.btn.danger:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+.mrow{display:flex;gap:8px;margin-top:9px;flex-wrap:wrap}
+.res{margin-top:9px;padding:8px 11px;border-radius:8px;font-size:12.5px;border:1px solid}
+.pin{background:rgba(210,153,34,.09);border:1px solid rgba(210,153,34,.32);color:#e3b341;
+  padding:7px 10px;border-radius:8px;font-size:12px;margin-top:8px}
 @media (max-width:700px){
+  .modal{padding:14px;border-radius:10px}
+  .srv{flex-direction:column;gap:7px}
+  .srv .acts{justify-content:flex-start}
   header{padding:11px 14px;gap:9px}
   h1{font-size:14px}
   main{padding:14px 12px 44px}
@@ -99,6 +139,7 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
   <div class="dot" id="dot"></div>
   <h1>Stremio streaming server</h1>
   <div class="sub" id="hdr"></div>
+  <button class="gear" id="gear" title="Stremio servers" aria-label="Servers and settings">&#9881;</button>
 </header>
 <main>
   <div id="err"></div>
@@ -115,6 +156,40 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
     <code>downloadSpeed</code> and it is meaningless.
   </div>
 </main>
+
+<div class="ovl" id="ovl" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Stremio servers">
+    <div class="mhead">
+      <h2>Stremio servers</h2>
+      <button class="btn" id="mclose" data-act="close" style="margin-left:auto">Close</button>
+    </div>
+    <div class="sub" id="mpath" style="margin-top:4px"></div>
+    <div id="mpin"></div>
+
+    <div class="msec">Profiles</div>
+    <div id="mlist"></div>
+
+    <div class="msec">Detected on this host</div>
+    <div id="mdisc"></div>
+
+    <div class="msec">Add a server</div>
+    <input class="fld" id="fname" placeholder="Name &mdash; e.g. Living room" autocomplete="off" maxlength="60">
+    <input class="fld" id="furl" placeholder="http://192.0.2.10:11470" autocomplete="off"
+           spellcheck="false" autocapitalize="off">
+    <select class="fld" id="fcont"></select>
+    <div class="mrow">
+      <button class="btn" id="ftest" data-act="test">Test</button>
+      <button class="btn pri" id="fadd" data-act="add">Add server</button>
+    </div>
+    <div id="mres"></div>
+    <div class="sub" style="margin-top:14px;line-height:1.6">
+      A server is only added once it answers as a Stremio server. Any host and port works;
+      a remote one runs in <b>mode A</b> &mdash; swarm, peers and trackers, but no clients,
+      cache or buffer runway, because those need Docker access to that machine.
+      Container bindings can only be chosen from what was detected here.
+    </div>
+  </div>
+</div>
 
 <script>
 const B=(n)=>{n=n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}
@@ -328,8 +403,10 @@ async function tick(){
   LAST=d;
 
   document.getElementById('dot').className='dot'+(d.ok?'':' bad');
-  document.getElementById('hdr').textContent=
-    `v${d.server_version||'?'} · updated ${d.ts?Math.round(Date.now()/1000-d.ts):0}s ago`;
+  setHTML(document.getElementById('hdr'),
+    `${d.server_name?esc(d.server_name)+' &middot; ':''}v${esc(d.server_version||'?')}`
+    +`${d.mode?' &middot; '+modeBadge(d.mode):''}`
+    +` &middot; updated ${d.ts?Math.round(Date.now()/1000-d.ts):0}s ago`);
   setHTML(document.getElementById('err'), d.error?`<div class="err">${esc(d.error)}</div>`:'');
 
   const engines=d.engines||{}, es=Object.values(engines);
@@ -371,6 +448,174 @@ async function tick(){
     +'</table></div></div>'
     :'<div class="empty">No client connected to :11470 / :12470.</div>');
 }
+
+/* ---- settings popup -------------------------------------------------------
+   Rendered only when opened or after an action, never on the 2s tick, so typing is
+   never interrupted. The add form is deliberately NOT re-rendered -- its inputs keep
+   their own state and only the result line below is replaced. No <details> in here:
+   one built via innerHTML fires a spurious toggle. Delete confirms inline rather than
+   through confirm(), which would block the page. */
+const M = {cfg:{servers:[]}, disc:{}};
+
+async function api(path, body){
+  const opt = body===undefined ? {cache:'no-store'}
+            : {method:'POST', cache:'no-store', body:JSON.stringify(body)};
+  try{
+    const r = await fetch(path, opt);
+    try{ return await r.json(); }
+    catch(e){ return {error:`unexpected HTTP ${r.status} from ${path}`}; }
+  }catch(e){ return {error:'dashboard unreachable'}; }
+}
+
+const modeBadge=(m)=>`<span class="b ${m==='C'?'on':(m==='B'?'pz':'off')}">mode ${esc(m)}</span>`;
+
+function renderList(){
+  const c=M.cfg||{servers:[]};
+  document.getElementById('mpath').textContent='Written to '+(c.path||'?');
+  const pin=Object.entries(c.env_pinned||{}).filter(([,v])=>v).map(([k])=>k);
+  document.getElementById('mpin').innerHTML = pin.length
+    ? `<div class="pin"><b>${esc(pin.join(', '))}</b> ${pin.length>1?'are':'is'} pinned by an
+       environment variable, so switching profiles will not change ${pin.length>1?'them':'it'}.</div>`
+    : '';
+  document.getElementById('mlist').innerHTML=(c.servers||[]).map(s=>{
+    const act=s.id===c.active;
+    return `<div class="srv${act?' act':''}">
+      <div class="who">
+        <div class="nm">${esc(s.name)}${act?' <span class="b sr">active</span>':''}</div>
+        <div class="ur">${esc(s.url)}</div>
+        <div style="margin-top:5px" id="mode-${esc(s.id)}"><span class="sub">checking…</span></div>
+        <div class="sub" id="note-${esc(s.id)}"></div>
+        <div class="sub">${s.container
+          ? `container <b>${esc(s.container)}</b>`
+          : 'no container bound &mdash; HTTP only'}</div>
+      </div>
+      <div class="acts">
+        ${act?'':`<button class="btn" data-act="switch" data-id="${esc(s.id)}">Use</button>`}
+        <button class="btn" data-act="del" data-id="${esc(s.id)}">Delete</button>
+      </div></div>`;}).join('') || '<div class="sub">No profiles configured.</div>';
+}
+
+/* Each profile is probed on open so the list says what it can actually do, rather
+   than implying every entry is equally capable. */
+function probeAll(){
+  for(const s of (M.cfg.servers||[])){
+    api('/api/servers/'+encodeURIComponent(s.id)+'/test', {}).then(r=>{
+      const el=document.getElementById('mode-'+s.id);
+      const nt=document.getElementById('note-'+s.id);
+      if(!el) return;
+      el.innerHTML = r.ok ? `${modeBadge(r.mode)} <span class="sub">v${esc(r.version)}</span>`
+                          : '<span class="b bad">unreachable</span>';
+      if(nt) nt.textContent = r.ok ? (r.notes||[]).join(' · ') : (r.error||'');
+    });
+  }
+}
+
+function renderDisc(){
+  const d=M.disc||{}, el=document.getElementById('mdisc');
+  if(!d.docker){
+    el.innerHTML=`<div class="sub">No Docker access from the dashboard host &mdash;
+      ${esc(d.error||'unknown')}. Nothing can be auto-detected; add servers by URL below.</div>`;
+    return;
+  }
+  const cs=d.containers||[];
+  if(!cs.length){
+    el.innerHTML='<div class="sub">Docker answers, but no Stremio container is running here.</div>';
+    return;
+  }
+  const known=new Set((M.cfg.servers||[]).map(s=>s.container).filter(Boolean));
+  el.innerHTML=cs.map(c=>`<div class="srv">
+    <div class="who">
+      <div class="nm">${esc(c.name)}${known.has(c.name)?' <span class="b off">already added</span>':''}</div>
+      <div class="ur">${esc(c.image)}</div>
+      <div class="sub">${c.url?esc(c.url)+' &middot; full mode C available'
+        :'port 11470 is not published &mdash; enter a URL manually'}</div>
+    </div>
+    <div class="acts">${c.url
+      ?`<button class="btn" data-act="use" data-id="${esc(c.id)}">Use this</button>`:''}</div>
+  </div>`).join('');
+}
+
+function renderChoices(){
+  const sel=document.getElementById('fcont'), cs=(M.disc&&M.disc.containers)||[];
+  sel.innerHTML='<option value="">No container &mdash; HTTP only (mode A)</option>'+
+    cs.map(c=>`<option value="${esc(c.id)}">Bind to ${esc(c.name)} &mdash; full mode C</option>`).join('');
+}
+
+function showResult(r){
+  const el=document.getElementById('mres');
+  if(!r){ el.innerHTML=''; return; }
+  if(!r.ok){ el.innerHTML=`<div class="res v-bad">${esc(r.error||'not reachable')}</div>`; return; }
+  const n=(r.notes||[]).length?' &middot; '+esc(r.notes.join('; ')):'';
+  el.innerHTML=`<div class="res v-ok">Stremio <b>v${esc(r.version)}</b> answered &mdash;
+    this would run in <b>mode ${esc(r.mode)}</b>${n}</div>`;
+}
+
+const F=(id)=>document.getElementById(id);
+function formBody(){
+  return {name:F('fname').value.trim(), url:F('furl').value.trim(),
+          container_id:F('fcont').value};
+}
+async function doTest(){
+  F('mres').innerHTML='<div class="sub" style="margin-top:9px">testing…</div>';
+  showResult(await api('/api/test', formBody()));
+}
+async function doAdd(){
+  const b=formBody();
+  if(!b.url){ showResult({error:'enter a URL first'}); return; }
+  F('mres').innerHTML='<div class="sub" style="margin-top:9px">checking, then adding…</div>';
+  const r=await api('/api/servers', b);
+  if(r.error){ showResult(r.probe||{error:r.error}); return; }
+  F('fname').value=''; F('furl').value=''; F('fcont').value='';
+  M.cfg=r.config; renderList(); renderDisc(); probeAll();
+  F('mres').innerHTML=`<div class="res v-ok">Added &mdash; running in
+    <b>mode ${esc((r.probe||{}).mode||'A')}</b>. Press <b>Use</b> to switch to it.</div>`;
+}
+function useDetected(cid){
+  const c=((M.disc&&M.disc.containers)||[]).find(x=>x.id===cid); if(!c) return;
+  if(!F('fname').value.trim()) F('fname').value=c.name;
+  F('furl').value=c.url; F('fcont').value=c.id;
+  doTest();
+}
+async function switchTo(id){
+  const r=await api('/api/active',{id});
+  if(r.error){ showResult({error:r.error}); return; }
+  M.cfg=r.config; renderList(); probeAll();
+}
+async function doDelete(id){
+  const r=await api('/api/servers/'+encodeURIComponent(id)+'/delete', {});
+  if(r.error){ showResult({error:r.error}); return; }
+  M.cfg=r.config; renderList(); renderDisc(); probeAll();
+}
+function armDelete(btn,id){
+  if(btn.dataset.armed==='1'){ doDelete(id); return; }
+  btn.dataset.armed='1'; btn.textContent='Confirm'; btn.classList.add('danger');
+  setTimeout(()=>{ if(btn.isConnected&&btn.dataset.armed==='1'){
+    btn.dataset.armed=''; btn.textContent='Delete'; btn.classList.remove('danger'); } },4000);
+}
+
+async function openSettings(){
+  F('ovl').hidden=false;
+  showResult(null);
+  const [cfg,disc]=await Promise.all([api('/api/config'), api('/api/discover')]);
+  M.cfg=cfg.servers?cfg:{servers:[]}; M.disc=disc||{};
+  renderList(); renderDisc(); renderChoices(); probeAll();
+}
+const closeSettings=()=>{ F('ovl').hidden=true; };
+
+F('gear').addEventListener('click', openSettings);
+F('ovl').addEventListener('click', ev=>{
+  if(ev.target.id==='ovl'){ closeSettings(); return; }         // backdrop
+  const t=ev.target.closest('[data-act]'); if(!t) return;
+  const a=t.dataset.act, id=t.dataset.id||'';
+  if(a==='close') closeSettings();
+  else if(a==='switch') switchTo(id);
+  else if(a==='del') armDelete(t,id);
+  else if(a==='use') useDetected(id);
+  else if(a==='test') doTest();
+  else if(a==='add') doAdd();
+});
+document.addEventListener('keydown', ev=>{ if(ev.key==='Escape') closeSettings(); });
+
 tick(); setInterval(tick,2000);
 </script>
 </body>

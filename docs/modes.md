@@ -26,7 +26,9 @@ multiple clients and any seeding. Badged as estimated where used.
 
 - **HTTP** gets you everything the Stremio server itself knows: swarm state, peers,
   trackers, progress. `ffprobe` runs against the stream URL, so the required-bitrate
-  verdict needs no special access either.
+  verdict needs no special access either — but note *where* it runs: inside the container
+  when one is bound, otherwise on the dashboard host. Mode A therefore needs `ffprobe`
+  on the dashboard host, and says so in the verdict when it is missing.
 - **Docker access** adds `docker logs` (range requests → playhead) and letting the
   container measure its own cache.
 - **The network namespace** is the only place `bytes_acked` per client socket exists.

@@ -38,7 +38,8 @@ server is never told play/pause.
 - A Stremio streaming server (the one bundled with Stremio Desktop, or a container
   image such as `tsaridas/stremio-docker`)
 - Python 3.9+ — no third-party packages
-- `ffprobe` on PATH for the bitrate verdict
+- `ffprobe` for the bitrate verdict — inside the Stremio container when the dashboard is
+  bound to one, otherwise on the dashboard host
 - Optional: Docker access to the Stremio container for the deeper signals
 
 See [docs/modes.md](docs/modes.md) for exactly what each level of access buys you.
@@ -62,7 +63,21 @@ Copy `config.example.json` to `config.json` and set the server URL:
 
 `client_names` is per server — different servers sit on different LANs. Anything not
 listed shows as its raw address. Every value can also be overridden by environment
-variable (`STREMIO_URL`, `DASH_PORT`, …).
+variable (`STREMIO_URL`, `DASH_PORT`, …); anything pinned that way is flagged in the UI,
+which then refuses to pretend a switch took effect.
+
+### Servers, from the UI
+
+The gear icon opens the server list. It offers any Stremio container it finds on the
+local Docker daemon, and takes a full URL with port for a server anywhere else on the
+network. **Nothing is saved until the address answers as a Stremio server**, and the
+popup says which mode the addition would achieve before you commit to it. Switching the
+active server takes effect immediately — no restart.
+
+Container bindings can only be picked from what was detected locally. That is deliberate:
+there is no authentication, and a container name is handed to `docker exec`, so it is
+never accepted as free text. URLs are free text because they only ever reach an HTTP
+client. Docker socket paths, cache directories and poll intervals stay file-only.
 
 ## Run
 
@@ -76,8 +91,8 @@ For a systemd service, see [`deploy/`](deploy/).
 
 ## Status
 
-Working and in daily use. A container image and multi-server switching are in progress —
-see the roadmap in `docs/`.
+Working and in daily use, with multi-server switching. The container image is the
+remaining work — see the roadmap in `docs/`.
 
 ## Licence
 

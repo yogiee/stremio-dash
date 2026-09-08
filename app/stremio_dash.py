@@ -26,8 +26,10 @@ import calendar
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
+import urllib.parse
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -75,10 +77,22 @@ def load_config():
 
 
 CFG = load_config()
-SRV = next((s for s in CFG["servers"] if s.get("id") == CFG.get("active")), CFG["servers"][0])
+CFG_LOCK = threading.RLock()
 
-SERVER       = os.environ.get("STREMIO_URL", SRV["url"])
-CONTAINER    = os.environ.get("STREMIO_CONTAINER", SRV.get("container") or "stremio")
+# The active profile is switchable at runtime from the settings popup, so what used
+# to be module constants now live in ACTIVE behind CFG_LOCK. Environment variables
+# still win -- but they pin that field for the whole process, so the UI is TOLD and
+# disables the control rather than pretending a switch took effect.
+ENV_PINNED = {"url": "STREMIO_URL" in os.environ,
+              "container": "STREMIO_CONTAINER" in os.environ,
+              "cache_dir": "STREMIO_CACHE" in os.environ}
+ACTIVE = {"id": None, "name": "", "url": "", "netloc": "", "scheme": "http",
+          "container": "", "cache_dir": "", "client_names": {}}
+# Bumped on every switch. Anything holding derived state compares its own copy and
+# throws that state away when it moves -- history from server A must never be shown
+# against server B.
+GEN = 0
+
 LISTEN_HOST  = os.environ.get("DASH_HOST", CFG["listen"]["host"])
 LISTEN_PORT  = int(os.environ.get("DASH_PORT", CFG["listen"]["port"]))
 POLL         = float(os.environ.get("DASH_POLL", CFG["poll"]["interval_sec"]))
@@ -88,12 +102,7 @@ POLL         = float(os.environ.get("DASH_POLL", CFG["poll"]["interval_sec"]))
 DETAIL_SEC   = float(os.environ.get("DASH_DETAIL_SEC", CFG["poll"]["detail_sec"]))
 SETTINGS_SEC = float(os.environ.get("DASH_SETTINGS_SEC", CFG["poll"]["settings_sec"]))
 HISTORY      = int(os.environ.get("DASH_HISTORY", CFG["poll"]["history"]))
-# Empty => ask the container to measure its own cache (portable; no host path).
-CACHE_DIR    = os.environ.get("STREMIO_CACHE", SRV.get("cache_dir") or "")
 DO_RDNS      = os.environ.get("DASH_RDNS", "1" if CFG.get("rdns", True) else "0") == "1"
-# IP -> friendly name, per server: different servers sit on different LANs, so this
-# cannot be global. Unknown addresses show as the raw IP.
-CLIENT_NAMES = SRV.get("client_names") or {}
 
 CLIENT_PORTS = {11470, 12470}
 WEBUI_PORTS  = {8080}
@@ -105,6 +114,7 @@ IGNORE_CLIENT_IPS = {"127.0.0.1"}
 STATE_LOCK = threading.Lock()
 STATE = {
     "ok": False, "error": None, "ts": 0, "server_version": None,
+    "server_name": "", "mode": None,
     "engines": {}, "clients": [], "funnel": {}, "cache": {}, "settings": {},
 }
 HIST     = defaultdict(lambda: deque(maxlen=HISTORY))   # infohash -> samples
@@ -124,25 +134,67 @@ RATE_WINDOW   = 1e9
 RDNS = {}
 RDNS_PENDING = set()
 BITRATE = {}          # (infohash, idx) -> bytes/sec required for real-time playback
+BITRATE_ERR = {}      # (infohash, idx) -> why the probe produced nothing
 BITRATE_TRIED = {}    # (infohash, idx) -> last attempt ts
 
 
-_CONN = {"c": None}
+_CONN = {"c": None, "netloc": None}
 _CONN_LOCK = threading.Lock()
-_HOSTPORT = SERVER.split("//", 1)[-1].rstrip("/")
+
+
+def parse_server_url(url):
+    """Validate a user-supplied server URL -> (normalised, scheme, netloc).
+
+    The settings popup accepts free text, so this is the boundary that stops a typo
+    -- or anything more deliberate -- from reaching http.client. The scheme is
+    restricted to http/https because this value only ever addresses a Stremio
+    server; it is never handed to a shell."""
+    url = (url or "").strip()
+    if re.search(r"[\s\x00-\x1f]", url):
+        raise ValueError("URL contains whitespace or control characters")
+    if "//" not in url:
+        url = "http://" + url
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("URL must start with http:// or https://")
+    if not u.hostname:
+        raise ValueError("URL has no host")
+    try:
+        port = u.port
+    except ValueError:
+        raise ValueError("URL has an invalid port")
+    host = f"[{u.hostname}]" if ":" in u.hostname else u.hostname   # IPv6 literal
+    netloc = host if port is None else f"{host}:{port}"
+    return f"{u.scheme}://{netloc}", u.scheme, netloc
+
+
+def _connect(netloc, scheme, timeout):
+    cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    return cls(netloc, timeout=timeout)
 
 
 def http_json(path, timeout=4):
-    """Single keep-alive connection. Reconnects on any error, retries once.
+    """Single keep-alive connection to the ACTIVE server. Reconnects on any error,
+    retries once.
 
     Deliberately NOT one connection per request: at a 2s poll that left ~90
     TIME-WAIT sockets sitting in the container's table, which is both wasteful
     and pollutes the very client list this dashboard reports."""
+    with CFG_LOCK:
+        netloc, scheme = ACTIVE["netloc"], ACTIVE["scheme"]
+    if not netloc:
+        raise RuntimeError("no active server configured")
     with _CONN_LOCK:
+        if _CONN["netloc"] != netloc:      # the profile was switched under us
+            try:
+                _CONN["c"].close()
+            except Exception:
+                pass
+            _CONN.update(c=None, netloc=netloc)
         for attempt in (0, 1):
             try:
                 if _CONN["c"] is None:
-                    _CONN["c"] = http.client.HTTPConnection(_HOSTPORT, timeout=timeout)
+                    _CONN["c"] = _connect(netloc, scheme, timeout)
                 c = _CONN["c"]
                 c.request("GET", path, headers={"Connection": "keep-alive"})
                 r = c.getresponse()
@@ -179,6 +231,7 @@ def human_addr(a):
 
 # ------------------------------------------------------------- container
 _pid_cache = {"pid": None, "at": 0}
+_TAILER = {"proc": None}
 
 
 def container_pid():
@@ -186,12 +239,16 @@ def container_pid():
     addresses. Traffic from a gateway is this dashboard polling the API, not a
     viewer -- and the bridge subnet differs per host, so it must be discovered
     rather than assumed."""
+    with CFG_LOCK:
+        container = ACTIVE["container"]
+    if not container:
+        return None                      # HTTP-only profile: mode A by definition
     now = time.time()
     if _pid_cache["pid"] and now - _pid_cache["at"] < 30:
         return _pid_cache["pid"]
     try:
         fmt = "{{.State.Pid}}{{range .NetworkSettings.Networks}} {{.Gateway}}{{end}}"
-        out = subprocess.run(["docker", "inspect", "-f", fmt, CONTAINER],
+        out = subprocess.run(["docker", "inspect", "-f", fmt, container],
                              capture_output=True, text=True, timeout=8)
         parts = out.stdout.split()
         pid = int(parts[0])
@@ -213,7 +270,10 @@ def read_sockets():
     """Client sockets (with delivered-byte rates) + BT peer dial funnel."""
     pid = container_pid()
     if not pid:
-        return [], {"error": "container not running"}
+        with CFG_LOCK:
+            bound = bool(ACTIVE["container"])
+        return [], {"error": "container not running" if bound
+                    else "no container bound - HTTP-only profile"}
     try:
         r = subprocess.run(["nsenter", "-t", str(pid), "-n", "ss", "-tina"],
                            capture_output=True, text=True, timeout=8)
@@ -328,13 +388,22 @@ def log_time(line, fallback):
 def log_tailer():
     """Follow the container log for range requests -> playhead byte offset."""
     while True:
+        with CFG_LOCK:
+            container, gen = ACTIVE["container"], GEN
+        if not container:
+            time.sleep(3)                # HTTP-only profile: no log to follow
+            continue
+        p = None
         try:
             p = subprocess.Popen(
                 # Replay recent history so a dashboard restart mid-stream does not
                 # lose the connection's start offset (clients rarely re-request).
-                ["docker", "logs", "-f", "-t", "--tail", "3000", CONTAINER],
+                ["docker", "logs", "-f", "-t", "--tail", "3000", container],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            _TAILER["proc"] = p
             for line in p.stdout:
+                if GEN != gen:           # switched servers: this log is now the wrong one
+                    break
                 m = LOG_RE.search(line)
                 if not m:
                     continue
@@ -359,6 +428,13 @@ def log_tailer():
                     cur.update(offset=start, at=now, cand=None)
         except Exception:
             time.sleep(5)
+        finally:
+            _TAILER["proc"] = None
+            if p is not None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
         # Stream ended: usually the container was recreated (watchtower) or
         # restarted. Re-attach by NAME, which resolves to the new container.
         time.sleep(3)
@@ -379,48 +455,69 @@ def rdns_worker(q):
 def probe_worker(q):
     """One ffprobe per stream, in the background, to get the REQUIRED bitrate.
 
-    The server's own /probe endpoint 500s on this build, but ffprobe inside the
-    container against the local stream URL returns in ~0.15s even when the file is
-    only 2.7% downloaded (the header is at the front and already cached). This is
-    the honest "how fast does playback need to be fed" number; deriving it from the
-    playhead was unreliable because players issue non-playback range requests."""
+    The server's own /probe endpoint 500s on this build, but ffprobe against the
+    stream URL returns in ~0.15s even when the file is only 2.7% downloaded (the
+    header is at the front and already cached). This is the honest "how fast does
+    playback need to be fed" number; deriving it from the playhead was unreliable
+    because players issue non-playback range requests.
+
+    Runs inside the container when one is bound -- the stream is always reachable at
+    the container-local port, whatever it is published as. For an HTTP-only profile
+    there is no container to exec into, so it falls back to ffprobe on THIS host
+    against the server URL. That fallback is what makes the verdict work in mode A;
+    without it a remote profile has no required-bitrate figure at all."""
+    ARGS = ["-v", "quiet", "-print_format", "json",
+            "-show_entries", "format=duration,bit_rate,size"]
     while True:
         ih, idx = q.get()
         key = (ih, idx)
-        br = 0.0
+        with CFG_LOCK:
+            container, url = ACTIVE["container"], ACTIVE["url"]
+        if container:
+            cmd = ["docker", "exec", container, "ffprobe"] + ARGS + \
+                  [f"http://127.0.0.1:11470/{ih}/{idx}"]
+        else:
+            cmd = ["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}"]
+        br, err = 0.0, ""
         try:
-            r = subprocess.run(
-                ["docker", "exec", CONTAINER, "ffprobe", "-v", "quiet",
-                 "-print_format", "json", "-show_entries", "format=duration,bit_rate,size",
-                 f"http://127.0.0.1:11470/{ih}/{idx}"],
-                capture_output=True, text=True, timeout=30)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             fmt = json.loads(r.stdout or "{}").get("format", {})
             if fmt.get("bit_rate"):
                 br = float(fmt["bit_rate"]) / 8.0
             elif fmt.get("size") and fmt.get("duration"):
                 br = float(fmt["size"]) / float(fmt["duration"])
-        except Exception:
-            br = 0.0
+            if not br:
+                err = (r.stderr or "ffprobe returned no bitrate").strip()[:120]
+        except FileNotFoundError:
+            # Degrade explicitly: say the tool is missing rather than silently
+            # showing no verdict forever.
+            err = ("ffprobe not installed on the dashboard host"
+                   if not container else "docker not available")
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:120]
         if br > 0:
             BITRATE[key] = br
+            BITRATE_ERR.pop(key, None)
+        else:
+            BITRATE_ERR[key] = err or "unavailable"
 
 
 # Stremio removes a cached file on eviction but leaves the infohash directory behind
 # forever, so most entries are empty stubs and must not be counted as cached titles.
-def cache_stats_host():
+def cache_stats_host(cache_dir):
     """Measure a cache directory visible on this filesystem.
 
     -B1 is real disk usage: Stremio creates each file at full length and fills it
     sparsely, so apparent size (du -sb) overstates it badly."""
-    out = subprocess.run(["du", "-s", "-B1", CACHE_DIR],
+    out = subprocess.run(["du", "-s", "-B1", cache_dir],
                          capture_output=True, text=True, timeout=120).stdout.split()
-    dirs = [d for d in os.scandir(CACHE_DIR) if d.is_dir()]
+    dirs = [d for d in os.scandir(cache_dir) if d.is_dir()]
     held = sum(1 for d in dirs if any(os.scandir(d.path)))
     return {"bytes": int(out[0]), "entries": held, "stubs": len(dirs) - held,
-            "dir": CACHE_DIR, "via": "host"}
+            "dir": cache_dir, "via": "host"}
 
 
-def cache_stats_container():
+def cache_stats_container(container):
     """Ask the container to measure its own cache -- no host path, works wherever the
     Docker API reaches. Note busybox du rejects -B1, but -sk is fine."""
     root = ((STATE.get("settings") or {}).get("cacheRoot") or "/root/.stremio-server")
@@ -431,7 +528,7 @@ def cache_stats_container():
         'ls -1 "$D" 2>/dev/null | wc -l; '
         'n=0; for x in "$D"/*/; do [ -n "$(ls -A "$x" 2>/dev/null)" ] && n=$((n+1)); done; '
         'echo $n' % path)
-    out = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c", script],
+    out = subprocess.run(["docker", "exec", container, "sh", "-c", script],
                          capture_output=True, text=True, timeout=120)
     kb, total, held = (int(v) for v in out.stdout.split()[:3])
     return {"bytes": kb * 1024, "entries": held, "stubs": total - held,
@@ -440,14 +537,254 @@ def cache_stats_container():
 
 def cache_worker():
     while True:
+        with CFG_LOCK:
+            cache_dir, container = ACTIVE["cache_dir"], ACTIVE["container"]
         try:
-            stats = cache_stats_host() if CACHE_DIR else cache_stats_container()
+            if cache_dir:
+                stats = cache_stats_host(cache_dir)
+            elif container:
+                stats = cache_stats_container(container)
+            else:
+                # Mode A: the cache lives on a host we cannot reach. Saying so beats
+                # showing a blank tile.
+                stats = {"error": "no container bound - HTTP-only profile",
+                         "dir": "(unreachable)"}
             with STATE_LOCK:
                 STATE["cache"] = stats
         except Exception as e:
             with STATE_LOCK:
-                STATE["cache"] = {"error": str(e), "dir": CACHE_DIR or "(container)"}
+                STATE["cache"] = {"error": str(e), "dir": cache_dir or "(container)"}
         time.sleep(60)
+
+
+# --------------------------------------------------------- servers / config
+# Everything below backs the settings popup. Two rules shape it, and they are not
+# the same rule:
+#
+#   1. A server URL is free text -- that is the point, any host and any port -- but
+#      it only ever reaches http.client, never a shell. parse_server_url() is the
+#      boundary.
+#   2. A CONTAINER NAME is never accepted from the client. Container names are handed
+#      to `docker exec` and `nsenter`, so the popup may only choose from the set this
+#      process itself discovered, by id, re-validated against a fresh `docker ps` at
+#      write time. The UI therefore offers the container it found without ever being
+#      able to name an arbitrary one -- which is what "no Docker endpoints from the
+#      UI" was protecting against.
+#
+# There is still no authentication (settled: this is a LAN tool). Anyone who can
+# reach the dashboard can repoint it. What they cannot do is make it run something.
+
+PORT_RE = re.compile(r"(?:(?:\d+\.\d+\.\d+\.\d+|\[[^\]]+\]):)?(\d+)->(\d+)/tcp")
+
+
+def published_port(ports, want):
+    """0.0.0.0:11470->11470/tcp  ->  11470 (the HOST port, which may differ)."""
+    for m in PORT_RE.finditer(ports or ""):
+        if int(m.group(2)) == want:
+            return int(m.group(1))
+    return None
+
+
+def discover_containers():
+    """Stremio containers on the local Docker daemon, for the popup to offer.
+
+    Read-only: `docker ps` and nothing else. Matching is on name or image because
+    the image is what identifies a Stremio server build, while the name is what the
+    user recognises."""
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=8)
+        if r.returncode != 0:
+            return {"docker": False, "containers": [],
+                    "error": (r.stderr or "docker ps failed").strip()[:160]}
+    except FileNotFoundError:
+        return {"docker": False, "containers": [],
+                "error": "no docker CLI on the dashboard host"}
+    except Exception as e:
+        return {"docker": False, "containers": [], "error": f"{type(e).__name__}: {e}"[:160]}
+
+    out = []
+    for line in r.stdout.splitlines():
+        f = line.split("\t")
+        if len(f) < 4:
+            continue
+        cid, name, image, ports = f[0], f[1], f[2], f[3]
+        if "stremio" not in f"{name} {image}".lower():
+            continue
+        hp = published_port(ports, 11470)
+        out.append({"id": cid, "name": name, "image": image, "port": hp,
+                    "url": f"http://127.0.0.1:{hp}" if hp else "",
+                    "ports": ports})
+    return {"docker": True, "containers": out, "error": None}
+
+
+def resolve_discovered(container_id):
+    """Map a container id the UI offered back to its real name, re-checking it still
+    exists. This is the closed vocabulary: nothing else may set ACTIVE['container']."""
+    if not container_id:
+        return ""
+    for c in discover_containers().get("containers") or []:
+        if c["id"] == container_id or c["name"] == container_id:
+            return c["name"]
+    raise ValueError("that container is no longer running")
+
+
+def _probe_pid(container):
+    """Container PID without touching the live _pid_cache or IGNORE_CLIENT_IPS --
+    this runs against servers that are not the active one."""
+    try:
+        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", container],
+                           capture_output=True, text=True, timeout=8)
+        pid = int((r.stdout or "0").strip() or 0)
+        return pid or None
+    except Exception:
+        return None
+
+
+def probe_server(url, container=""):
+    """Is this URL a reachable Stremio server, and which mode would it achieve?
+
+    Called before anything is written: a profile that cannot be reached is never
+    saved. Also reports the mode so the popup can say what the addition will
+    actually buy, rather than implying every server is equal."""
+    try:
+        norm, scheme, netloc = parse_server_url(url)
+    except ValueError as e:
+        return {"ok": False, "url": url, "error": str(e)}
+
+    info = {"ok": False, "url": norm, "version": None, "mode": None, "notes": []}
+    try:
+        c = _connect(netloc, scheme, 4)
+        try:
+            c.request("GET", "/settings", headers={"Connection": "close"})
+            r = c.getresponse()
+            body = r.read()
+        finally:
+            c.close()
+        if r.status != 200:
+            info["error"] = f"HTTP {r.status} from {norm}/settings"
+            return info
+        vals = (json.loads(body.decode("utf-8", "replace")) or {}).get("values") or {}
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"[:160]
+        return info
+
+    if "serverVersion" not in vals:
+        info["error"] = "reachable, but does not look like a Stremio streaming server"
+        return info
+
+    info.update(ok=True, version=vals.get("serverVersion"), mode="A")
+    if container:
+        pid = _probe_pid(container)
+        if not pid:
+            info["notes"].append(f"container '{container}' is not running - HTTP only")
+        else:
+            info["mode"] = "B"
+            try:
+                rr = subprocess.run(["nsenter", "-t", str(pid), "-n", "ss", "-tin"],
+                                    capture_output=True, text=True, timeout=8)
+                if rr.returncode == 0:
+                    info["mode"] = "C"
+                else:
+                    info["notes"].append("no netns access - no clients or dial funnel")
+            except Exception:
+                info["notes"].append("nsenter unavailable - no clients or dial funnel")
+    return info
+
+
+# ------------------------------------------------------------ config writes
+def find_server(cfg, sid):
+    return next((s for s in cfg["servers"] if s.get("id") == sid), None)
+
+
+def new_id(cfg, name):
+    base = re.sub(r"[^a-z0-9]+", "-", (name or "server").lower()).strip("-") or "server"
+    sid, n = base, 2
+    while find_server(cfg, sid):
+        sid, n = f"{base}-{n}", n + 1
+    return sid
+
+
+def save_config(cfg):
+    """Atomic replace, so a crash mid-write cannot leave an unparseable config."""
+    path = cfg.get("_path") or next((c for c in CONFIG_PATHS if c), None)
+    if not path:
+        raise RuntimeError("no config path to write to")
+    body = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)) or ".",
+                               prefix=".config.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(body, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+    cfg["_path"] = path
+
+
+def reset_derived():
+    """History, playhead, sockets and bitrates all describe ONE server. Showing
+    server A's sparkline under server B's name would be a lie, so a switch drops the
+    lot and the UI simply refills over the next few ticks."""
+    with _CONN_LOCK:
+        try:
+            _CONN["c"].close()
+        except Exception:
+            pass
+        _CONN.update(c=None, netloc=None)
+    for d in (HIST, PLAYHEAD, NEEDS, SOCK_HIST, BITRATE, BITRATE_ERR,
+              BITRATE_TRIED, RDNS, RDNS_PENDING):
+        d.clear()
+    _pid_cache.update(pid=None, at=0)
+    IGNORE_CLIENT_IPS.clear()
+    IGNORE_CLIENT_IPS.add("127.0.0.1")
+    proc = _TAILER.get("proc")          # unblock the tailer from the old container
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    with STATE_LOCK:
+        STATE.update(ok=False, error=None, ts=0, server_version=None,
+                     engines={}, clients=[], funnel={}, cache={}, settings={})
+
+
+def set_active(srv):
+    """Point the collector at a profile. Environment overrides still win."""
+    global GEN
+    norm, scheme, netloc = parse_server_url(os.environ.get("STREMIO_URL", srv.get("url", "")))
+    with CFG_LOCK:
+        ACTIVE.update(
+            id=srv.get("id"), name=srv.get("name") or srv.get("id") or "Stremio",
+            url=norm, scheme=scheme, netloc=netloc,
+            container=os.environ.get("STREMIO_CONTAINER", srv.get("container") or ""),
+            cache_dir=os.environ.get("STREMIO_CACHE", srv.get("cache_dir") or ""),
+            client_names=dict(srv.get("client_names") or {}))
+        GEN += 1
+    reset_derived()
+
+
+def config_view():
+    """What the settings popup is allowed to see."""
+    with CFG_LOCK:
+        return {
+            "active": ACTIVE["id"],
+            "active_url": ACTIVE["url"],
+            "env_pinned": ENV_PINNED,
+            "path": CFG.get("_path") or "(defaults - nothing on disk yet)",
+            "servers": [{"id": s.get("id"),
+                         "name": s.get("name") or s.get("id"),
+                         "url": s.get("url"),
+                         "container": s.get("container") or "",
+                         "client_names": s.get("client_names") or {}}
+                        for s in CFG["servers"]],
+        }
 
 
 # -------------------------------------------------------------- collector
@@ -466,9 +803,14 @@ def collect():
     set_cache = {"at": 0.0, "v": {}}
     if DO_RDNS:
         threading.Thread(target=rdns_worker, args=(rq,), daemon=True).start()
+    my_gen = GEN
 
     while True:
         t0 = time.time()
+        if GEN != my_gen:          # switched profile: these caches describe the old one
+            my_gen = GEN
+            det_cache.clear()
+            set_cache.update(at=0.0, v={})
         try:
             raw = http_json("/stats.json")
             engines = {}
@@ -544,8 +886,10 @@ def collect():
 
             clients, funnel = read_sockets()
             total_ingest = sum(e["speed"] for e in engines.values())
+            with CFG_LOCK:
+                names = ACTIVE["client_names"]
             for c in clients:
-                c["name"] = CLIENT_NAMES.get(c["ip"], "")
+                c["name"] = names.get(c["ip"], "")
                 # Nothing arriving from peers while the client is consuming means the
                 # bytes are coming off the local cache, not the swarm.
                 c["from_cache"] = bool(c.get("active")) and total_ingest <= 0
@@ -581,6 +925,7 @@ def collect():
 
                 key = (ih, e["idx"])
                 e["required_bps"] = BITRATE.get(key, 0.0)
+                e["required_err"] = BITRATE_ERR.get(key, "")
                 req, sp = e["required_bps"], e["speed"]
                 e["buffered_secs"] = (ahead / req) if (ahead is not None and req) else None
                 if not req or ahead is None:
@@ -601,10 +946,23 @@ def collect():
                 except Exception:
                     pass
 
+            # Report the mode actually achieved, not the one configured: a bound
+            # container that is not running buys nothing, and saying "B" then would
+            # be exactly the kind of unsupported claim this dashboard avoids.
+            with CFG_LOCK:
+                bound, sname = bool(ACTIVE["container"]), ACTIVE["name"]
+            ferr = funnel.get("error") or ""
+            if not bound or "not running" in ferr:
+                mode = "A"
+            elif not ferr:
+                mode = "C"
+            else:
+                mode = "B"
             with STATE_LOCK:
                 STATE.update(ok=True, error=None, ts=t0, engines=engines,
                              clients=clients, funnel=funnel, settings=st,
-                             server_version=st.get("serverVersion"))
+                             server_version=st.get("serverVersion"),
+                             server_name=sname, mode=mode)
             for ih in list(HIST):
                 if ih not in engines:
                     HIST.pop(ih, None)
@@ -616,6 +974,20 @@ def collect():
                 STATE.update(ok=False, error=f"{type(e).__name__}: {e}", ts=t0)
 
         time.sleep(max(0.5, POLL - (time.time() - t0)))
+
+
+# Activate the configured profile now that every helper it touches is defined. A
+# broken URL in config.json must not stop the process booting -- the dashboard comes
+# up and says so, which is far easier to fix than a service that will not start.
+_initial = next((s for s in CFG["servers"] if s.get("id") == CFG.get("active")),
+                CFG["servers"][0] if CFG["servers"] else {"id": "local", "url": ""})
+try:
+    set_active(_initial)
+except ValueError as _e:
+    print(f"config: active server '{_initial.get('id')}' has an unusable URL ({_e})",
+          flush=True)
+    with STATE_LOCK:
+        STATE.update(ok=False, error=f"config: {_e}")
 
 
 # ------------------------------------------------------------------ http
@@ -635,18 +1007,160 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 65536:            # a profile list is never large
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8", "replace")) or {}
+
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/api/state":
             with STATE_LOCK:
                 body = json.dumps(STATE)
             self._send(body, "application/json")
+        elif p == "/api/config":
+            self._json(config_view())
+        elif p == "/api/discover":
+            self._json(discover_containers())
         elif p == "/healthz":
             self._send("ok\n", "text/plain")
         elif p in ("/", "/index.html"):
             self._send(PAGE, "text/html; charset=utf-8")
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        p = self.path.split("?")[0]
+        try:
+            body = self._body()
+        except Exception:
+            return self._json({"error": "malformed JSON body"}, 400)
+        try:
+            if p == "/api/test":
+                return self._json(self._test(body))
+            if p == "/api/servers":
+                return self._json(self._add(body))
+            if p == "/api/active":
+                return self._json(self._activate(body))
+            if p.startswith("/api/servers/"):
+                rest = p[len("/api/servers/"):]
+                if rest.endswith("/delete"):
+                    return self._json(self._delete(rest[:-len("/delete")]))
+                if rest.endswith("/test"):
+                    return self._json(self._test_saved(rest[:-len("/test")]))
+                return self._json(self._edit(rest, body))
+        except ValueError as e:                 # user-fixable: bad URL, gone container
+            return self._json({"error": str(e)}, 400)
+        except Exception as e:
+            return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
+        self.send_error(404)
+
+    # -- the container name never comes from the client: only an id it was offered
+    @staticmethod
+    def _container_for(body):
+        return resolve_discovered(body.get("container_id") or "")
+
+    def _test(self, body):
+        return probe_server(body.get("url") or "", self._container_for(body))
+
+    def _test_saved(self, sid):
+        """Probe a stored profile. Its container name came from config, not from the
+        client, so it is used as-is."""
+        with CFG_LOCK:
+            srv = find_server(CFG, sid)
+            if not srv:
+                return {"error": "no such profile"}
+            url, container = srv.get("url") or "", srv.get("container") or ""
+        out = probe_server(url, container)
+        out["id"] = sid
+        return out
+
+    def _add(self, body):
+        name = (body.get("name") or "").strip()[:60]
+        container = self._container_for(body)
+        probe = probe_server(body.get("url") or "", container)
+        # An unreachable server is never written. Half the value of the popup is
+        # refusing to save something that will only fail silently later.
+        if not probe.get("ok"):
+            return {"error": probe.get("error") or "server is not reachable", "probe": probe}
+        with CFG_LOCK:
+            if any(s.get("url") == probe["url"] for s in CFG["servers"]):
+                return {"error": "a profile with that URL already exists"}
+            sid = new_id(CFG, name or urllib.parse.urlsplit(probe["url"]).hostname)
+            CFG["servers"].append({"id": sid, "name": name or sid, "url": probe["url"],
+                                   "container": container, "cache_dir": None,
+                                   "client_names": {}})
+            save_config(CFG)
+        return {"ok": True, "id": sid, "probe": probe, "config": config_view()}
+
+    def _edit(self, sid, body):
+        with CFG_LOCK:
+            srv = find_server(CFG, sid)
+            if not srv:
+                return {"error": "no such profile"}
+            hard = False                    # a hard change invalidates collected history
+            if "name" in body:
+                srv["name"] = (body.get("name") or "").strip()[:60] or srv["id"]
+            if "client_names" in body:
+                cn = body.get("client_names") or {}
+                srv["client_names"] = {str(k)[:45]: str(v)[:60] for k, v in cn.items()}
+            if body.get("url"):
+                probe = probe_server(body["url"], srv.get("container") or "")
+                if not probe.get("ok"):
+                    return {"error": probe.get("error") or "server is not reachable",
+                            "probe": probe}
+                hard = hard or srv.get("url") != probe["url"]
+                srv["url"] = probe["url"]
+            if "container_id" in body:
+                c = self._container_for(body)
+                hard = hard or (srv.get("container") or "") != c
+                srv["container"] = c
+            save_config(CFG)
+            active = ACTIVE["id"] == sid
+        if active:
+            if hard:
+                set_active(srv)
+            else:                            # a rename must not throw away sparklines
+                with CFG_LOCK:
+                    ACTIVE["name"] = srv.get("name") or srv["id"]
+                    ACTIVE["client_names"] = dict(srv.get("client_names") or {})
+        return {"ok": True, "config": config_view()}
+
+    def _delete(self, sid):
+        with CFG_LOCK:
+            srv = find_server(CFG, sid)
+            if not srv:
+                return {"error": "no such profile"}
+            if len(CFG["servers"]) == 1:
+                return {"error": "that is the only profile - add another first"}
+            CFG["servers"].remove(srv)
+            fallback = CFG["servers"][0] if ACTIVE["id"] == sid else None
+            if fallback:
+                CFG["active"] = fallback["id"]
+            save_config(CFG)
+        if fallback:
+            set_active(fallback)
+        return {"ok": True, "config": config_view()}
+
+    def _activate(self, body):
+        with CFG_LOCK:
+            srv = find_server(CFG, body.get("id"))
+            if not srv:
+                return {"error": "no such profile"}
+            CFG["active"] = srv["id"]
+            save_config(CFG)
+        set_active(srv)
+        return {"ok": True, "config": config_view()}
 
 
 PAGE = r"""<title>Stremio Server</title>
@@ -884,5 +1398,8 @@ if __name__ == "__main__":
     threading.Thread(target=cache_worker, daemon=True).start()
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     srv.daemon_threads = True
-    print(f"stremio-dash on http://{LISTEN_HOST}:{LISTEN_PORT}  -> {SERVER}", flush=True)
+    print(f"stremio-dash on http://{LISTEN_HOST}:{LISTEN_PORT}  -> "
+          f"{ACTIVE['url'] or '(no server configured)'}"
+          f"{' via ' + ACTIVE['container'] if ACTIVE['container'] else ' (HTTP only)'}",
+          flush=True)
     srv.serve_forever()

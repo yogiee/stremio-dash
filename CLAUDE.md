@@ -97,6 +97,10 @@ These were all established empirically against a live server. Re-deriving them i
 - A `<details open>` built via `innerHTML` fires a **spurious `toggle` on insertion**. Panel
   state is therefore session-scoped and updated only on a real `click` on the `<summary>`.
 - Collapsed panels are not rendered at all; only their summary count updates.
+- A CSS rule with `display:` **outranks the UA rule for `[hidden]`**. The settings overlay
+  is `.ovl{display:flex}`, so without an explicit `.ovl[hidden]{display:none}` the popup
+  is open on page load. Any new `display:`-carrying class that also uses `hidden` needs
+  the same pairing.
 - Degrade **explicitly**. Say "unknown" rather than asserting a state the data doesn't support.
 
 ## Layout
