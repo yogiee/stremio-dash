@@ -14,3 +14,6 @@ NOTES.homelab.md
 
 # SSH credentials for deploy targets - never published
 .*-ssh
+
+# Remembered stream titles, written beside config.json
+names.json

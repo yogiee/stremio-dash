@@ -18,6 +18,9 @@ What you get depends on how it can reach the Stremio server.
 | clients table (who, delivered rate, RTT, idle/streaming/cache) | — | — | ✅ |
 | peer dial funnel | — | — | ✅ |
 | "serving from cache" state | — | ~ | ✅ |
+| **stop a stream** | ✅ | ✅ | ✅ |
+| **delete cached data** | — | ✅ | ✅ |
+| who is watching, shown before a stop | — | — | ✅ |
 
 `~` = approximable from the container's aggregate TX counter, which conflates
 multiple clients and any seeding. Badged as estimated where used.

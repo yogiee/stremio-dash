@@ -96,9 +96,11 @@ Still file-only, deliberately: Docker socket paths, `cache_dir`, poll intervals.
 Run the container on a second port **alongside** the systemd service, confirm parity, then
 retire the unit and move the reverse-proxy entry. Do not swap a working service in place.
 
-## Phase 6 — control actions  *(proposed 2026-09-17, not started)*
+## Phase 6 — control actions  *(agreed and built 2026-09-17; live test pending)*
 
 This lifts the read-only rule for exactly two actions. `/settings` stays untouched.
+Built and tested against a fake Stremio server and a fake cache. Still needs a live
+test with real players.
 
 **Stop stream** — `GET /{ih}/remove`.
 - It destroys the engine, which stops the swarm, but does **not** delete cached data.
@@ -112,11 +114,13 @@ This lifts the read-only rule for exactly two actions. `/settings` stays untouch
 Stremio has no endpoint for this: its own eviction only runs when an engine is created.
 Needs mode B or better.
 
-**Abandoned badge** (read-only) — an engine still downloading, with no range requests for
-N minutes, while a newer engine is active.
+**ffprobe retry backoff** — **done**. Retries back off from 120 s to 30 min. The old fixed
+120 s equalled Stremio's engine timeout, so a hanging probe could keep a stalled engine
+alive.
 
-**ffprobe retry backoff** — the 120 s retry equals Stremio's engine timeout, so a hanging
-probe could keep a stalled engine alive.
+Not built: an **abandoned badge**. Range requests are no signal here, because a player
+reading on one long-lived connection makes none, so "no requests for N minutes" would
+flag healthy playback.
 
 Background: Stremio destroys an engine 120 s after its last stream connection closes, and
 only pauses its swarm once the file is fully cached. So a switched-away stream keeps
@@ -124,7 +128,7 @@ downloading for two minutes by design, longer if the player leaks the connection
 
 ## Out of scope
 
-- Writing to the Stremio server, beyond the two actions proposed in Phase 6. The dashboard
-  never POSTs `/settings`.
+- Writing to the Stremio server, beyond the two actions in Phase 6. The dashboard never
+  POSTs `/settings`.
 - Authentication. It is a LAN tool. If that changes, the settings popup needs rethinking.
 - Historical storage. Everything is in-memory ring buffers; a restart loses history by design.

@@ -25,6 +25,7 @@ import json
 import os
 import calendar
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -139,7 +140,24 @@ RDNS = {}
 RDNS_PENDING = set()
 BITRATE = {}          # (infohash, idx) -> bytes/sec required for real-time playback
 BITRATE_ERR = {}      # (infohash, idx) -> why the probe produced nothing
-BITRATE_TRIED = {}    # (infohash, idx) -> last attempt ts
+BITRATE_TRIED = {}    # (infohash, idx) -> (last attempt ts, delay before the next)
+# Every ffprobe opens the stream, and an open stream keeps Stremio's engine alive for
+# another 120s. Retrying at a fixed 120s could therefore hold a stalled engine open
+# forever, so a failing probe backs off.
+PROBE_RETRY_MIN, PROBE_RETRY_MAX = 120, 1800
+
+IH_RE = re.compile(r"^[0-9a-f]{40}$")
+# Engines this dashboard stopped -> when. Any GET /{ih}/{idx} re-creates an engine, so
+# our own ffprobe must leave a stopped title alone; and if it comes back anyway, some
+# client asked for it again, which the card says rather than hiding.
+STOPPED = {}
+STOP_QUIET = 60        # s: no probing a title we just stopped
+STOP_NOTE = 300        # s: how long a re-opened title is flagged as such
+# infohash -> title. A cache directory holds no name, so titles are remembered as
+# engines are seen, and persisted beside the config (pruned to what is still cached).
+NAMES = {}
+_NAMES = {"dirty": False, "saved": 0.0}
+CACHE_KICK = threading.Event()     # re-measure the cache now
 
 
 _CONN = {"c": None, "netloc": None}
@@ -650,6 +668,8 @@ def probe_worker(q):
     while True:
         ih, idx = q.get()
         key = (ih, idx)
+        if time.time() - STOPPED.get(ih, 0) < STOP_QUIET:
+            continue            # queued before the stop: probing would re-create it
         with CFG_LOCK:
             container, url = ACTIVE["container"], ACTIVE["url"]
         attempts = [(["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}"], "here")]
@@ -710,18 +730,23 @@ def cache_stats_host(cache_dir):
             "dir": cache_dir, "via": "host"}
 
 
+def container_cache_path():
+    root = ((STATE.get("settings") or {}).get("cacheRoot") or "/root/.stremio-server")
+    return root.rstrip("/") + "/stremio-cache"
+
+
 def cache_stats_container(container):
     """Ask the container to measure its own cache -- no host path, works wherever the
     Docker API reaches. Note busybox du rejects -B1, but -sk is fine."""
-    root = ((STATE.get("settings") or {}).get("cacheRoot") or "/root/.stremio-server")
-    path = root.rstrip("/") + "/stremio-cache"
-    script = (
-        'D="%s"; [ -d "$D" ] || exit 3; '
-        'du -sk "$D" | cut -f1; '
-        'ls -1 "$D" 2>/dev/null | wc -l; '
-        'n=0; for x in "$D"/*/; do [ -n "$(ls -A "$x" 2>/dev/null)" ] && n=$((n+1)); done; '
-        'echo $n' % path)
-    out = subprocess.run(["docker", "exec", container, "sh", "-c", script],
+    path = container_cache_path()
+    # The path comes from the server's /settings, so it is passed as $1 rather than
+    # spliced into the script.
+    script = ('D="$1"; [ -d "$D" ] || exit 3; '
+              'du -sk "$D" | cut -f1; '
+              'ls -1 "$D" 2>/dev/null | wc -l; '
+              'n=0; for x in "$D"/*/; do [ -n "$(ls -A "$x" 2>/dev/null)" ] && n=$((n+1)); done; '
+              'echo $n')
+    out = subprocess.run(["docker", "exec", container, "sh", "-c", script, "sh", path],
                          capture_output=True, text=True, timeout=120)
     if out.returncode == 3:
         # Stremio creates the directory with its first engine, so on a fresh server
@@ -753,12 +778,201 @@ def cache_worker():
         with STATE_LOCK:
             if GEN == gen:          # a switch mid-measurement: this is the old server
                 STATE["cache"] = stats
-        # Once a minute, but at once after a server switch: reset_derived() blanks
-        # the tile, and it should not sit on "measuring..." for a minute.
+        # Once a minute, but at once after a server switch (reset_derived() blanks
+        # the tile) or a deletion (the figure is now wrong).
         for _ in range(30):
-            time.sleep(2)
+            if CACHE_KICK.wait(2):
+                CACHE_KICK.clear()
+                break
             if GEN != gen:
                 break
+
+
+# ------------------------------------------------------------ control actions
+# The dashboard was read-only until these two. They are the only writes it makes to a
+# Stremio server, and /settings stays untouched.
+#
+#   stop   GET /{ih}/remove -- Stremio destroys the engine and its swarm at once,
+#          instead of 120s after the last client lets go (or never, while a player
+#          leaks the connection). It does NOT delete the cached data.
+#   cache  delete stremio-cache/<ih>/ for titles that are not loaded. Stremio has no
+#          endpoint for this; its own eviction only runs when an engine is created.
+#
+# Deleting under a loaded engine would pull the file out from under a live stream, so
+# every deletion is re-checked against a fresh /stats.json, not the last tick.
+
+def names_path():
+    base = CFG.get("_path") or next((p for p in CONFIG_PATHS if p), "")
+    return os.path.join(os.path.dirname(os.path.abspath(base)), "names.json") if base else ""
+
+
+def load_names():
+    try:
+        with open(names_path()) as fh:
+            NAMES.update({k: str(v)[:200] for k, v in json.load(fh).items() if IH_RE.match(k)})
+    except Exception:
+        pass
+
+
+def remember_name(ih, name):
+    if name and name != ih and NAMES.get(ih) != name:
+        NAMES[ih] = name[:200]
+        _NAMES["dirty"] = True
+
+
+def save_names(force=False):
+    """Atomic, at most every 30s. A failure only costs names after a restart."""
+    now = time.time()
+    if not _NAMES["dirty"] or (not force and now - _NAMES["saved"] < 30):
+        return
+    path = names_path()
+    if not path:
+        return
+    _NAMES.update(dirty=False, saved=now)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".names.", suffix=".tmp")
+        with os.fdopen(fd, "w") as fh:
+            json.dump(dict(NAMES), fh, indent=1)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"names: not saved ({e})", flush=True)
+
+
+def forget_engine(ih):
+    for d in (HIST, PLAYHEAD, NEEDS):
+        d.pop(ih, None)
+    for d in (BITRATE, BITRATE_ERR, BITRATE_TRIED):
+        for k in [k for k in d if k[0] == ih]:
+            d.pop(k, None)
+    with STATE_LOCK:
+        STATE["engines"] = {k: v for k, v in STATE["engines"].items() if k != ih}
+
+
+def cache_reach():
+    """-> (where, how) or raise ValueError when this profile cannot touch the cache."""
+    with CFG_LOCK:
+        cache_dir, container = ACTIVE["cache_dir"], ACTIVE["container"]
+    if cache_dir:
+        return cache_dir, "host"
+    if container:
+        pid, _cid, why = container_pid()
+        if not pid:
+            raise ValueError(f"cache unreachable: {why}")
+        return container, "container"
+    raise ValueError("the cache is not reachable in mode A - no container bound")
+
+
+# One line per entry: name, KiB used, file count, newest mtime. Busybox-compatible.
+LIST_SCRIPT = (
+    'D="$1"; [ -d "$D" ] || exit 3; cd "$D" || exit 4; '
+    'for x in */; do x="${x%/}"; [ -d "$x" ] || continue; '
+    'n=$(ls -A "$x" | wc -l); '
+    't=$( (stat -c %Y "$x" "$x"/* 2>/dev/null || true) | sort -n | tail -1); '
+    'printf "%s\t%s\t%s\t%s\n" "$x" "$(du -sk "$x" | cut -f1)" "$n" "${t:-0}"; done')
+
+
+def list_cache():
+    """Every entry in the cache directory, with size, file count, last write, the title
+    if one was ever seen, and whether an engine currently holds it."""
+    where, how = cache_reach()
+    rows = []
+    if how == "host":
+        if not os.path.isdir(where):
+            raise ValueError(f"cache directory {where} does not exist")
+        for d in os.scandir(where):
+            if not d.is_dir(follow_symlinks=False):
+                continue
+            used, n, newest = 0, 0, d.stat().st_mtime
+            for f in os.scandir(d.path):
+                st = f.stat(follow_symlinks=False)
+                used += st.st_blocks * 512        # real usage: files are sparse
+                n += 1
+                newest = max(newest, st.st_mtime)
+            rows.append((d.name, used, n, newest))
+        path = where
+    else:
+        path = container_cache_path()
+        r = subprocess.run(["docker", "exec", where, "sh", "-c", LIST_SCRIPT, "sh", path],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode == 3:
+            return {"dir": path, "via": how, "entries": []}
+        if r.returncode != 0:
+            raise RuntimeError(first_line(r.stderr, f"cannot list {path}"))
+        for line in r.stdout.splitlines():
+            f = line.split("\t")
+            if len(f) == 4 and f[1].isdigit() and f[2].isdigit():
+                rows.append((f[0], int(f[1]) * 1024, int(f[2]),
+                             int(f[3]) if f[3].isdigit() else 0))
+    with STATE_LOCK:
+        loaded = {ih: e.get("name") for ih, e in STATE["engines"].items()}
+    entries = [{"infohash": name, "bytes": used, "files": n, "mtime": newest,
+                "name": loaded.get(name) or NAMES.get(name, ""),
+                "loaded": name in loaded, "deletable": bool(IH_RE.match(name))}
+               for name, used, n, newest in rows]
+    entries.sort(key=lambda e: (-e["bytes"], -e["mtime"]))
+    # Keep remembered names bounded to what is still on disk or playing.
+    keep = {e["infohash"] for e in entries} | set(loaded)
+    for ih in [k for k in NAMES if k not in keep]:
+        NAMES.pop(ih, None)
+        _NAMES["dirty"] = True
+    save_names(force=True)
+    return {"dir": path, "via": how, "entries": entries}
+
+
+def delete_cache(infohashes=(), all_inactive=False):
+    where, how = cache_reach()
+    if all_inactive:
+        infohashes = [e["infohash"] for e in list_cache()["entries"]
+                      if e["deletable"] and not e["loaded"]]
+    live = set(http_json("/stats.json").keys())       # fresh, not the last tick
+    todo, skipped = [], []
+    for ih in dict.fromkeys(infohashes):
+        if not isinstance(ih, str) or not IH_RE.match(ih):
+            skipped.append({"infohash": str(ih)[:60], "why": "not an infohash"})
+        elif ih in live:
+            skipped.append({"infohash": ih, "why": "loaded - stop it first"})
+        else:
+            todo.append(ih)
+    if todo:
+        if how == "host":
+            for ih in todo:
+                shutil.rmtree(os.path.join(where, ih), ignore_errors=True)
+        else:
+            # Names are validated hex, and argv is not a shell: nothing to inject.
+            base = container_cache_path()
+            r = subprocess.run(["docker", "exec", where, "rm", "-rf", "--"] +
+                               [f"{base}/{ih}" for ih in todo],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode != 0:
+                raise RuntimeError(first_line(r.stderr, "rm failed"))
+    CACHE_KICK.set()
+    return {"ok": True, "deleted": todo, "skipped": skipped}
+
+
+def stop_engine(ih, delete=False):
+    if not isinstance(ih, str) or not IH_RE.match(ih):
+        raise ValueError("not an infohash")
+    if ih not in http_json("/stats.json"):
+        raise ValueError("that stream is not loaded any more")
+    # "In progress" until Stremio confirms, then the time it did. A tick whose stats were
+    # fetched before that moment still lists the engine, and must neither show it nor
+    # probe it (a probe would re-create it).
+    STOPPED[ih] = float("inf")
+    try:
+        http_json(f"/{ih}/remove", timeout=10)    # answers once the engine is destroyed
+    except Exception:
+        STOPPED.pop(ih, None)
+        raise
+    STOPPED[ih] = time.time()
+    forget_engine(ih)
+    out = {"ok": True, "stopped": ih}
+    if delete:
+        try:
+            out["cache"] = delete_cache([ih])
+        except (ValueError, RuntimeError) as e:
+            out["cache"] = {"error": str(e)}
+    print(f"stop: {NAMES.get(ih) or ih}{' + cache' if delete else ''}", flush=True)
+    return out
 
 
 # --------------------------------------------------------- servers / config
@@ -970,7 +1184,7 @@ def reset_derived():
             pass
         _CONN.update(c=None, netloc=None)
     for d in (HIST, PLAYHEAD, NEEDS, SOCK_HIST, BITRATE, BITRATE_ERR,
-              BITRATE_TRIED, RDNS, RDNS_PENDING):
+              BITRATE_TRIED, RDNS, RDNS_PENDING, STOPPED):
         d.clear()
     _pid_cache.update(pid=None, id="", why="", at=0)
     _SOCK.update(key=None, at=0, argv=None, via="", why="")
@@ -1089,9 +1303,11 @@ def collect():
                         n["prev_offset"], n["prev_at"] = ph["offset"], ph["at"]
                     need = n["need"]
 
+                name = det.get("streamName") or s.get("name") or ih
+                remember_name(ih, name)
                 engines[ih] = {
                     "infohash": ih,
-                    "name": det.get("streamName") or s.get("name") or ih,
+                    "name": name,
                     "torrent": s.get("name") or "",
                     "idx": idx,
                     "len": length,
@@ -1115,6 +1331,11 @@ def collect():
                     "spark": [h["speed"] for h in hist],
                     "peer_spark": [h["peers"] for h in hist],
                 }
+
+            # Fetched before a stop completed: stale for that engine, and showing it would
+            # read as "re-opened".
+            for ih in [k for k in engines if STOPPED.get(k, 0) > t0]:
+                engines.pop(ih)
 
             clients, funnel = read_sockets()
             total_ingest = sum(e["speed"] for e in engines.values())
@@ -1166,9 +1387,15 @@ def collect():
                     e["runway_secs"] = -1        # sustainable / whole file in hand
                 else:
                     e["runway_secs"] = ahead / (req - sp)
-                if key not in BITRATE and t0 - BITRATE_TRIED.get(key, 0) > 120:
-                    BITRATE_TRIED[key] = t0
+                since_stop = t0 - STOPPED.get(ih, -1e9)
+                e["reopened_after_stop"] = since_stop if since_stop < STOP_NOTE else None
+                last, delay = BITRATE_TRIED.get(key, (0.0, PROBE_RETRY_MIN))
+                if key not in BITRATE and since_stop >= STOP_QUIET and t0 - last >= delay:
+                    BITRATE_TRIED[key] = (t0, min(delay * 2, PROBE_RETRY_MAX) if last else delay)
                     pq.put(key)
+            for ih in [k for k, t in STOPPED.items() if t0 - t >= STOP_NOTE]:
+                STOPPED.pop(ih, None)
+            save_names()
 
             st = set_cache["v"]
             if t0 - set_cache["at"] >= SETTINGS_SEC:
@@ -1309,6 +1536,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(config_view())
         elif p == "/api/discover":
             self._json(discover_containers())
+        elif p == "/api/cache":
+            try:
+                self._json(list_cache())
+            except (ValueError, RuntimeError) as e:
+                self._json({"error": str(e), "entries": []})
+            except Exception as e:
+                self._json({"error": f"{type(e).__name__}: {e}", "entries": []}, 500)
         elif p == "/healthz":
             self._send("ok\n", "text/plain")
         elif p in ("/", "/index.html"):
@@ -1321,11 +1555,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0]
+        # There is no authentication, so a page on another origin must not be able to
+        # fire these. A cross-origin JSON POST needs a CORS preflight, which this server
+        # never grants; the form-style content types that skip the preflight are refused.
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return self._json({"error": "Content-Type must be application/json"}, 415)
         try:
             body = self._body()
         except Exception:
             return self._json({"error": "malformed JSON body"}, 400)
         try:
+            if p == "/api/cache/delete":
+                return self._json(delete_cache(body.get("infohashes") or [],
+                                               all_inactive=bool(body.get("all_inactive"))))
+            m = re.fullmatch(r"/api/engines/([0-9a-f]{40})/stop", p)
+            if m:
+                return self._json(stop_engine(m.group(1), delete=bool(body.get("delete_cache"))))
             if p == "/api/test":
                 return self._json(self._test(body))
             if p == "/api/servers":
@@ -1341,6 +1587,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self._edit(rest, body))
         except ValueError as e:                 # user-fixable: bad URL, gone container
             return self._json({"error": str(e)}, 400)
+        except RuntimeError as e:               # the server or Docker said no
+            return self._json({"error": str(e)}, 502)
         except Exception as e:
             return self._json({"error": f"{type(e).__name__}: {e}"}, 500)
         self.send_error(404)
@@ -1491,6 +1739,7 @@ PAGE, PAGE_OK = load_page()
 
 
 if __name__ == "__main__":
+    load_names()
     threading.Thread(target=collect, daemon=True).start()
     threading.Thread(target=log_tailer, daemon=True).start()
     threading.Thread(target=cache_worker, daemon=True).start()

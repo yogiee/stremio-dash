@@ -1,14 +1,15 @@
 # stremio-dash
 
-A read-only live dashboard for a [Stremio](https://www.stremio.com/) streaming server.
+A live dashboard for a [Stremio](https://www.stremio.com/) streaming server.
 
 The Stremio apps on **tvOS and iPadOS show no network stats** — they can't run torrent
 addons locally, so they stream through a shared streaming server instead. That server
 knows everything: peers, speeds, swarm health, what each client is pulling. None of it
 is surfaced. This surfaces it.
 
-It is strictly an observer. It never sits in the media byte path, so if it dies,
-playback is unaffected.
+It is an observer. It never sits in the media byte path, so if it dies, playback is
+unaffected. The only changes it makes are the two you ask for: stopping a stream and
+deleting cached data.
 
 ## What it shows
 
@@ -32,6 +33,26 @@ that visible.
 **Clients** — which devices are connected, their delivered rate, and whether each is
 streaming, serving from cache, or idle. Inferred from the socket, because the streaming
 server is never told play/pause.
+
+## What it can do
+
+**Stop a stream.** Switch to a different stream of the same title and the old one keeps
+downloading. Stremio only drops an engine two minutes after the last connection to it
+closes, and a player that never lets go of its old connection keeps it alive
+indefinitely. **Stop** on a card ends it at once.
+
+Before stopping, it tells you who is receiving data right now. A socket carries no
+infohash, so with several streams loaded it says when it cannot tell which one is being
+watched. What is already cached stays unless you also choose to delete it. If a player
+asks for the stream again, the card comes back marked **re-opened**.
+
+**Clear the cache.** **Cache** in the header lists every cached title with its size and
+when it was last written. You can delete selected titles, or everything not in use.
+Anything playing is refused, checked against the live server at the moment of deletion.
+Stremio has no endpoint for any of this: left alone, it only frees space when a new
+stream starts and the cache is over its cap. Titles are remembered in `names.json` next
+to the config, because the cache folder holds none. Needs Docker access, or the cache
+directory on the dashboard host.
 
 ## Requirements
 

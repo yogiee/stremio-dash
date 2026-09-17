@@ -5,7 +5,7 @@ python, javascript, docker, systemd, self-hosted
 
 ## What this is
 
-A read-only live dashboard for a Stremio **streaming server** (the `server.js` HTTP
+A live dashboard for a Stremio **streaming server** (the `server.js` HTTP
 service on :11470, not the Stremio app). The tvOS/iPadOS apps show no network stats;
 they stream through a shared server that knows everything, and this surfaces it.
 
@@ -15,7 +15,8 @@ Single-file Python collector (`app/stremio_dash.py`, stdlib only) + a single-fil
 ## Non-negotiables
 
 1. **It is an observer. It must never sit in the media byte path.** If it dies, playback
-   is unaffected. Never proxy stream bytes.
+   is unaffected. Never proxy stream bytes. Its only writes are the two user-requested
+   actions, stop and cache delete (ROADMAP Phase 6). It never POSTs `/settings`.
 2. **Never commit `config.json` or `NOTES.homelab.md`** — real LAN addresses and device
    names. Before every commit: `git diff --cached | grep -nEi '192\.168\.|10\.[0-9]+\.|\.local|<your-domain>'`.
    A homelab-specific README once reached the staging area; the sweep caught it.
@@ -101,6 +102,19 @@ These were all established empirically against a live server. Re-deriving them i
   usage — except busybox (in the container), which rejects `-B1`; there use `du -sk`.
 - Stremio leaves an empty infohash directory behind on eviction, so most cache entries are
   stubs. Count only directories holding data.
+
+**Control actions**
+- Every POST must be `Content-Type: application/json`. That is the CSRF guard, since there
+  is no auth: a cross-origin JSON POST needs a preflight this server never grants. The
+  page's `api()` sets the header. Anything new that POSTs must too.
+- `STOPPED[ih]` is `inf` while `/remove` is in flight, then the completion time. A tick
+  whose stats were fetched before completion (`STOPPED > t0`) drops that engine: showing
+  it would read as "re-opened". Probing it would re-create it, so ffprobe also stays
+  quiet for 60 s after a stop.
+- Cache deletion re-checks a **fresh** `/stats.json`, not the last tick. Directory names must
+  match 40-hex, and `rm` gets argv, not a shell.
+- The Stop confirmation and the cache panel are built on click, into slots the 2 s tick
+  never writes. Otherwise the tick would close them mid-decision.
 
 **Running in a container**
 - Inside a container, **127.0.0.1 is the dashboard**, not the host. Discovery rewrites a

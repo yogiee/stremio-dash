@@ -99,12 +99,25 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
 .btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.pri{background:rgba(88,166,255,.16);border-color:rgba(88,166,255,.45);color:#9ecbff}
 .btn.danger:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+.btn.warn{border-color:rgba(248,81,73,.45);color:#ff9a94}
 .mrow{display:flex;gap:8px;margin-top:9px;flex-wrap:wrap}
 .res{margin-top:9px;padding:8px 11px;border-radius:8px;font-size:12.5px;border:1px solid}
 .pin{background:rgba(210,153,34,.09);border:1px solid rgba(210,153,34,.32);color:#e3b341;
   padding:7px 10px;border-radius:8px;font-size:12px;margin-top:8px}
+.hbtn{margin-left:auto;background:var(--panel2);border:1px solid var(--bd);color:var(--mut);
+  height:32px;border-radius:8px;font-size:12px;padding:0 11px;cursor:pointer;flex:0 0 auto;font-family:inherit}
+.hbtn:hover{color:var(--fg);border-color:var(--blu)}
+.hbtn + .gear{margin-left:0}
+/* --- control actions --- */
+.hright{display:flex;gap:8px;align-items:flex-start;flex-shrink:0}
+.btn.sm{padding:3px 9px;font-size:11px}
+.confirm{margin-top:10px}
+.ctab td{vertical-align:top}
+.ctab .nm{word-break:break-word}
+.ctab input{margin:2px 0 0}
 @media (max-width:700px){
   .modal{padding:14px;border-radius:10px}
+  .hright{flex-direction:column;align-items:flex-end}
   .srv{flex-direction:column;gap:7px}
   .srv .acts{justify-content:flex-start}
   header{padding:11px 14px;gap:9px}
@@ -139,18 +152,21 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
   <div class="dot" id="dot"></div>
   <h1>Stremio streaming server</h1>
   <div class="sub" id="hdr"></div>
+  <button class="hbtn" id="cbtn" title="Manage the server's cache">Cache</button>
   <button class="gear" id="gear" title="Stremio servers" aria-label="Servers and settings">&#9881;</button>
 </header>
 <main>
   <div id="err"></div>
+  <div id="note"></div>
   <div class="tiles" id="tiles"></div>
   <div id="engines"></div>
   <div class="empty" id="empty" hidden>No active engines. Start playing something in Stremio.</div>
   <h2>Clients</h2>
   <div id="clients"></div>
   <div class="foot">
-    Read-only observer &mdash; polls <code>/stats.json</code>, the container socket table and the
-    container log. It is not in the media byte path.<br>
+    An observer &mdash; polls <code>/stats.json</code>, the container socket table and the
+    container log, and is not in the media byte path. Its only writes are the ones you ask for:
+    stopping a stream and deleting cached data.<br>
     Swarm stats belong to the <em>engine</em> (one per infohash) and are shared if two devices play
     the same title. <code>uploadSpeed</code> is not shown: the server mirrors it from
     <code>downloadSpeed</code> and it is meaningless.
@@ -191,6 +207,29 @@ h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);
   </div>
 </div>
 
+<div class="ovl" id="covl" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Cache">
+    <div class="mhead">
+      <h2>Cache</h2>
+      <button class="btn" data-act="close" style="margin-left:auto">Close</button>
+    </div>
+    <div class="sub" id="cpath" style="margin-top:4px"></div>
+    <div id="clist"></div>
+    <div class="mrow">
+      <button class="btn danger" id="cdel" data-act="cdel" disabled>Delete selected</button>
+      <button class="btn danger" id="cclear" data-act="cclear" disabled>Delete everything not in use</button>
+      <button class="btn" data-act="crefresh">Refresh</button>
+    </div>
+    <div id="cres"></div>
+    <div class="sub" style="margin-top:14px;line-height:1.6">
+      Stremio only frees space when a new stream starts and the cache is over its cap.
+      Anything playing is <b>in use</b> and cannot be deleted here &mdash; stop it on its card
+      first. A title shows as <i>unknown</i> when it was cached before this dashboard last saw
+      it play; the cache folder itself holds no name.
+    </div>
+  </div>
+</div>
+
 <script>
 const B=(n)=>{n=n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}
   return n.toFixed(n<10&&i>0?2:i?1:0)+' '+u[i]};
@@ -223,8 +262,12 @@ let LAST = null;                  // most recent /api/state payload
 const skeleton = () => `
   <div class="chead">
     <div class="title" data-r="name"></div>
-    <div class="badges" data-r="badges"></div>
+    <div class="hright">
+      <div class="badges" data-r="badges"></div>
+      <button class="btn sm" data-act="stop" title="Stop this stream on the server">Stop</button>
+    </div>
   </div>
+  <div class="confirm" data-c="confirm" hidden></div>
   <div class="meta" data-r="meta"></div>
   <div class="bar"><div class="fill" data-r="fill"></div><div class="ph" data-r="ph" hidden></div></div>
   <div class="row">
@@ -288,7 +331,7 @@ function makeCard(ih){
       paintPanels(ih);
     });
   });
-  const c={el,refs,details}; cards.set(ih,c);
+  const c={el,refs,details,confirm:el.querySelector('[data-c="confirm"]')}; cards.set(ih,c);
   document.getElementById('engines').appendChild(el);
   return c;
 }
@@ -302,7 +345,9 @@ function updateCard(e){
   const serving=e.consumers>0;
 
   r.name.textContent=e.name;
-  r.badges.innerHTML=(e.searching?'<span class="b sr">peer search</span>':'')+
+  r.badges.innerHTML=(e.reopened_after_stop!=null
+      ?`<span class="b pz" title="Stopped ${dur(e.reopened_after_stop)} ago, and a client asked for it again">re-opened</span>`:'')+
+    (e.searching?'<span class="b sr">peer search</span>':'')+
     (serving&&!active?'<span class="b on">from cache</span>'
       :(active?'<span class="b on">active</span>'
           :(e.paused?'<span class="b pz">swarm paused</span>':'<span class="b off">idle</span>')));
@@ -460,7 +505,8 @@ const M = {cfg:{servers:[]}, disc:{}};
 
 async function api(path, body){
   const opt = body===undefined ? {cache:'no-store'}
-            : {method:'POST', cache:'no-store', body:JSON.stringify(body)};
+            : {method:'POST', cache:'no-store', body:JSON.stringify(body),
+               headers:{'Content-Type':'application/json'}};
   try{
     const r = await fetch(path, opt);
     try{ return await r.json(); }
@@ -615,7 +661,171 @@ F('ovl').addEventListener('click', ev=>{
   else if(a==='test') doTest();
   else if(a==='add') doAdd();
 });
-document.addEventListener('keydown', ev=>{ if(ev.key==='Escape') closeSettings(); });
+document.addEventListener('keydown', ev=>{ if(ev.key==='Escape'){ closeSettings(); closeCache(); } });
+
+/* ---- stop a stream ---------------------------------------------------------
+   The confirmation is built once, on the click, into a slot updateCard never touches,
+   so the 2s tick cannot close it. What it says is honest about attribution: a client
+   socket carries no infohash, so with several streams loaded the dashboard can say
+   that somebody is watching, but not always what. */
+function note(html, cls){
+  const n=F('note');
+  n.innerHTML=`<div class="res ${cls||'v-ok'}" style="margin:0 0 14px">${html}</div>`;
+  clearTimeout(note.t); note.t=setTimeout(()=>{ n.innerHTML=''; },12000);
+}
+function stopStatus(ih){
+  const d=LAST||{}, e=(d.engines||{})[ih]||{};
+  const est=(d.clients||[]).filter(c=>c.state==='ESTAB');
+  const act=est.filter(c=>c.active), idle=est.filter(c=>!c.active);
+  const who=xs=>xs.map(c=>esc(c.name||c.ip)).join(', ');
+  const n=Object.keys(d.engines||{}).length;
+  if(d.mode!=='C')
+    return ['v-warn','Client activity is not visible in mode '+esc(d.mode||'?')
+      +', so this cannot say whether anyone is watching it.'];
+  if(e.consumers>0)
+    return ['v-bad',`<b>${who(act)}</b> ${act.length>1?'are':'is'} receiving this stream right now. `
+      +'Stopping it interrupts that playback.'];
+  if(act.length)
+    return ['v-warn',`<b>${who(act)}</b> ${act.length>1?'are':'is'} receiving data, but with ${n} streams `
+      +'loaded it cannot be told which. If it is this one, its playback stops.'];
+  let h='No client is receiving data right now.';
+  if(idle.length) h+=` ${idle.length} idle connection${idle.length>1?'s are':' is'} still open (${who(idle)}) `
+    +'&mdash; a player that never let go of a stream it moved away from looks exactly like this.';
+  return ['v-ok',h];
+}
+function armStop(ih){
+  const c=cards.get(ih); if(!c) return;
+  const [cls,html]=stopStatus(ih);
+  const cc=(LAST&&LAST.cache)||{}, canDel=!!(cc.via&&!cc.error);   // the cache is reachable
+  c.confirm.innerHTML=`<div class="verdict ${cls}" style="margin-top:0">${html}</div>
+    <div class="mrow">
+      <button class="btn warn danger" data-act="stop-go">Stop stream</button>
+      ${canDel?'<button class="btn warn danger" data-act="stop-del">Stop and delete its cached data</button>':''}
+      <button class="btn" data-act="stop-cancel">Cancel</button>
+    </div>
+    <div class="sub" style="margin-top:6px">Stopping ends the download at once. What is already
+      cached stays on disk${canDel?' unless you delete it':' (the cache is not reachable from here)'};
+      Stremio frees it later if space is needed.</div>`;
+  c.confirm.hidden=false;
+}
+function disarmStop(ih){
+  const c=cards.get(ih); if(!c) return;
+  c.confirm.hidden=true; c.confirm.innerHTML='';
+}
+async function doStop(ih, del){
+  const c=cards.get(ih); if(!c) return;
+  const btns=[...c.confirm.querySelectorAll('button')];
+  btns.forEach(b=>b.disabled=true);
+  const r=await api(`/api/engines/${ih}/stop`, {delete_cache:del});
+  if(r.error){
+    c.confirm.insertAdjacentHTML('beforeend',`<div class="res v-bad">${esc(r.error)}</div>`);
+    btns.forEach(b=>b.disabled=false);
+    return;
+  }
+  let msg=`Stopped <b>${esc(c.refs.name.textContent)}</b>.`, cls='v-ok';
+  if(del){
+    const cr=r.cache||{};
+    if((cr.deleted||[]).length) msg+=' Its cached data was deleted.';
+    else { cls='v-warn'; msg+=' Cached data was not deleted: '
+      +esc(cr.error||((cr.skipped||[])[0]||{}).why||'nothing to delete')+'.'; }
+  }
+  note(msg, cls);
+  c.el.remove(); cards.delete(ih);
+}
+F('engines').addEventListener('click', ev=>{
+  const t=ev.target.closest('[data-act]'); if(!t) return;
+  const card=t.closest('.card'); if(!card) return;
+  const ih=card.dataset.ih, a=t.dataset.act;
+  if(a==='stop') armStop(ih);
+  else if(a==='stop-go') doStop(ih,false);
+  else if(a==='stop-del') doStop(ih,true);
+  else if(a==='stop-cancel') disarmStop(ih);
+});
+
+/* ---- cache panel ----------------------------------------------------------
+   Rendered on open and after an action, never on the tick. */
+const CM={entries:[]};
+const ago=t=>t?dur(Date.now()/1000-t)+' ago':'—';
+function cacheButtons(){
+  const sel=[...F('clist').querySelectorAll('input[data-ih]:checked')];
+  F('cdel').disabled=!sel.length;
+  F('cclear').disabled=!CM.entries.some(e=>e.deletable&&!e.loaded);
+}
+function renderCache(d){
+  CM.entries=d.entries||[];
+  if(d.error){
+    F('cpath').textContent='';
+    F('clist').innerHTML=`<div class="res v-bad">${esc(d.error)}</div>`;
+    cacheButtons(); return;
+  }
+  const held=CM.entries.filter(e=>e.files>0), stubs=CM.entries.filter(e=>e.files===0);
+  const used=held.reduce((a,e)=>a+e.bytes,0), cap=((LAST||{}).settings||{}).cacheSize||0;
+  F('cpath').textContent=`${d.dir} · ${d.via==='container'?'inside the Stremio container':'on the dashboard host'}`
+    +` · ${B(used)} used${cap?' of a '+B(cap)+' cap':''}`;
+  if(!held.length && !stubs.length){
+    F('clist').innerHTML='<div class="empty" style="margin-top:10px;padding:20px">The cache is empty.</div>';
+    cacheButtons(); return;
+  }
+  F('clist').innerHTML=(held.length?`<div class="tw"><table class="ctab">
+    <tr><th></th><th>Title</th><th class="r">Size</th><th class="r sm-hide">Last written</th><th>State</th></tr>`+
+    held.map(e=>`<tr>
+      <td><input type="checkbox" data-ih="${esc(e.infohash)}" ${e.loaded||!e.deletable?'disabled':''}
+        aria-label="select ${esc(e.name||e.infohash)}"></td>
+      <td class="nm">${e.name?esc(e.name):'<span class="mut">unknown title</span>'}
+        <div class="num mut" style="font-size:10.5px">${esc(e.infohash.slice(0,16))}</div></td>
+      <td class="r num">${B(e.bytes)}</td>
+      <td class="r mut sm-hide">${ago(e.mtime)}</td>
+      <td>${e.loaded?'<span class="b on">in use</span>'
+        :(e.deletable?'<span class="mut">idle</span>':'<span class="mut">not a title</span>')}</td>
+    </tr>`).join('')+'</table></div>':'')
+    +(stubs.length?`<div class="sub" style="margin-top:8px">${stubs.length} empty folder${stubs.length>1?'s':''}
+      left behind by evicted titles${stubs.length>1?' are':' is'} cleared too by
+      <b>Delete everything not in use</b>.</div>`:'');
+  cacheButtons();
+}
+async function loadCache(){
+  F('clist').innerHTML='<div class="sub" style="margin-top:10px">measuring…</div>';
+  renderCache(await api('/api/cache'));
+}
+function showCacheResult(r){
+  if(r.error){ F('cres').innerHTML=`<div class="res v-bad">${esc(r.error)}</div>`; return; }
+  const size=Object.fromEntries(CM.entries.map(e=>[e.infohash,e.bytes]));
+  const n=(r.deleted||[]).length, freed=(r.deleted||[]).reduce((a,ih)=>a+(size[ih]||0),0);
+  const sk=(r.skipped||[]).map(x=>`${esc(x.infohash.slice(0,12))}: ${esc(x.why)}`).join('; ');
+  F('cres').innerHTML=`<div class="res ${sk?'v-warn':'v-ok'}">Deleted ${n} entr${n===1?'y':'ies'}`
+    +`${freed?`, freeing ${B(freed)}`:''}.${sk?' Skipped '+sk+'.':''}</div>`;
+}
+async function deleteSelected(){
+  const ihs=[...F('clist').querySelectorAll('input[data-ih]:checked')].map(i=>i.dataset.ih);
+  if(!ihs.length) return;
+  F('cdel').disabled=true;
+  const r=await api('/api/cache/delete',{infohashes:ihs});
+  showCacheResult(r); if(!r.error) loadCache(); else cacheButtons();
+}
+async function clearInactive(btn){
+  if(btn.dataset.armed!=='1'){
+    btn.dataset.armed='1'; btn.textContent='Confirm: delete all not in use';
+    setTimeout(()=>{ if(btn.dataset.armed==='1'){ btn.dataset.armed='';
+      btn.textContent='Delete everything not in use'; } },4000);
+    return;
+  }
+  btn.dataset.armed=''; btn.textContent='Delete everything not in use'; btn.disabled=true;
+  const r=await api('/api/cache/delete',{all_inactive:true});
+  showCacheResult(r); if(!r.error) loadCache(); else cacheButtons();
+}
+function openCache(){ F('covl').hidden=false; F('cres').innerHTML=''; loadCache(); }
+function closeCache(){ F('covl').hidden=true; }
+F('cbtn').addEventListener('click', openCache);
+F('covl').addEventListener('click', ev=>{
+  if(ev.target.id==='covl'){ closeCache(); return; }
+  const t=ev.target.closest('[data-act]'); if(!t) return;
+  const a=t.dataset.act;
+  if(a==='close') closeCache();
+  else if(a==='cdel') deleteSelected();
+  else if(a==='cclear') clearInactive(t);
+  else if(a==='crefresh'){ F('cres').innerHTML=''; loadCache(); }
+});
+F('covl').addEventListener('change', cacheButtons);
 
 tick(); setInterval(tick,2000);
 </script>
