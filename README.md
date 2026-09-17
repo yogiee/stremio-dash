@@ -75,6 +75,10 @@ There is nothing to configure for the common case. On first start, with no confi
 the dashboard binds to the one Stremio container it can see, waits for it to answer, and
 saves that to `/config/config.json`. If it sees several, pick one from the gear menu.
 
+On Linux, `network_mode: host` is worth considering: the dashboard then reaches the server
+at `127.0.0.1:11470` just as a copy running on the host would, so one config file works
+either way and moving between them needs no edit.
+
 | you add | you get |
 |---|---|
 | nothing but `STREMIO_URL=http://<server>:11470` | mode A: swarm, peers, trackers, bitrate verdict |

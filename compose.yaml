@@ -20,11 +20,15 @@ services:
       - ./stremio-server:/root/.stremio-server
 
   stremio-dash:
-    # Pin a release (e.g. :1.0.0) if something like watchtower updates your containers.
+    # Pin a release (e.g. :0.2.0) if something like watchtower updates your containers.
     image: ghcr.io/yogiee/stremio-dash:latest
     restart: unless-stopped
     ports:
       - "9481:9481"
+    # Alternative to the two lines above, if your Stremio server publishes its ports on the
+    # host: `network_mode: host`. The dashboard then reaches it at 127.0.0.1:11470, exactly
+    # as a copy running directly on the host would, which keeps one config file valid for
+    # both. Linux only.
     volumes:
       - ./stremio-dash:/config
       # Read access alone is not possible: anything that can reach this socket

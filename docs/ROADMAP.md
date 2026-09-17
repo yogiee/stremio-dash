@@ -1,8 +1,9 @@
 # Roadmap
 
-Status: **working and in daily use** as a systemd service, with multi-server switching.
-The container image is built and tested; it still needs a live-playback parity check and
-its first release.
+Status: **working and in daily use as a container**, with multi-server switching, stop and
+cache management. Released as `ghcr.io/yogiee/stremio-dash` (v0.1.0 packaging, v0.2.0
+control actions). The systemd path still works and is documented; the maintainer's own
+deployment has moved to the container.
 
 ## Settled decisions
 
@@ -20,7 +21,7 @@ Do not relitigate these; they were argued through and chosen deliberately.
 | Default container binding | **none**; discovered on first start | guessing `stremio-docker` made every install without that exact name report Docker errors. `bootstrap()` binds the one Stremio container it sees, and leaves several to the gear menu |
 | Combined server + dashboard image | **on hold** (2026-09-17) | worth doing, as a derived `FROM tsaridas/stremio-docker` image rather than a fork. Design and costs in [plan-combined-image.md](plan-combined-image.md). The standalone image ships first |
 
-## Phase 1 — container image  *(built; parity check pending)*
+## Phase 1 — container image  *(done)*
 
 - `Dockerfile`: alpine 3.24 + python3, docker-cli, **ffprobe** (ffmpeg) and iproute2. ~280 MB,
   most of it ffmpeg's codec libraries.
@@ -39,9 +40,9 @@ Do not relitigate these; they were argued through and chosen deliberately.
   and the stranded-probe case was detected and recovered from. The host `nsenter` path
   is unchanged, checked by running the new detection code on the live systemd host.
 
-**Remaining acceptance:** parity with the systemd deployment during real playback, with
-clients, funnel, playhead and runway all present. Needs a Linux host with a client
-streaming (Phase 5 does this).
+**Acceptance met** on 2026-09-17: run beside the systemd service during real playback from
+three clients, with clients, funnel, playhead and runway all present, and stop and cache
+management exercised on live streams.
 
 **Follow-up:** the image is heavy for what ffprobe does here (reading container duration).
 Either build a minimal static ffprobe (demuxers + http only) or read Matroska/MP4
@@ -87,20 +88,27 @@ Still file-only, deliberately: Docker socket paths, `cache_dir`, poll intervals.
   - Every push and PR builds and runs a real mode-C test next to `tsaridas/stremio-docker`.
   - Only a `vX.Y.Z` tag publishes `linux/amd64` + `linux/arm64` as `X.Y.Z`, `X.Y`, `X`
     and `latest`, so `:latest` moves on releases only.
-- First release: push a version tag. Then make the GHCR package public: new packages start
-  private.
+- ~~First release.~~ **Done**: v0.1.0 (packaging) and v0.2.0 (control actions). The GHCR
+  package came out public with no extra step.
 - Screenshots in the README.
 
-## Phase 5 — migrate the existing deployment
+## Phase 5 — migrate the existing deployment  *(done 2026-09-17)*
 
-Run the container on a second port **alongside** the systemd service, confirm parity, then
-retire the unit and move the reverse-proxy entry. Do not swap a working service in place.
+Ran on a second port alongside the systemd service, confirmed parity during real playback,
+then took over 9481. Two choices made in the move:
 
-## Phase 6 — control actions  *(agreed and built 2026-09-17; live test pending)*
+- **`network_mode: host`** for the dashboard. The container then reaches the server at the
+  same `127.0.0.1:11470` the unit used, so the *same config file* serves both and the
+  reverse-proxy entry needed no change. Without it the URL has to be rewritten to the
+  container network, which a rollback to systemd could not then use.
+- The unit is **stopped and disabled, not deleted**, and its directory is now the config
+  volume. Rollback is `systemctl enable --now stremio-dash` after stopping the container.
+
+## Phase 6 — control actions  *(done, released in v0.2.0)*
 
 This lifts the read-only rule for exactly two actions. `/settings` stays untouched.
-Built and tested against a fake Stremio server and a fake cache. Still needs a live
-test with real players.
+Built against a fake Stremio server and a fake cache, then confirmed on live streams from
+three clients on 2026-09-17.
 
 **Stop stream** — `GET /{ih}/remove`.
 - It destroys the engine, which stops the swarm, but does **not** delete cached data.
