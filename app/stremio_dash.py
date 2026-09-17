@@ -16,7 +16,8 @@ Sources, in descending order of portability:
   5. ss -tina in the netns      - client sockets (real LAN IPs) + peer dial funnel
 
 Only 1-3 work against a Stremio server on another host; 4 needs Docker access and
-5 needs to reach that container's network namespace. See docs/modes.md.
+5 needs to reach that container's network namespace -- by nsenter from the host, or,
+when this runs in a container itself, through the probe sidecar. See docs/modes.md.
 """
 
 import http.client
@@ -45,7 +46,10 @@ DEFAULTS = {
         "id": "local",
         "name": "Stremio",
         "url": "http://127.0.0.1:11470",
-        "container": "stremio-docker",
+        # Unbound until configured, or until bootstrap() finds the one Stremio
+        # container on this Docker host. Guessing a name here meant every fresh
+        # install without that exact container reported Docker errors.
+        "container": "",
         "cache_dir": None,          # null => measure inside the container instead
         "client_names": {},
     }],
@@ -193,10 +197,13 @@ def http_json(path, timeout=4):
             _CONN.update(c=None, netloc=netloc)
         for attempt in (0, 1):
             try:
-                if _CONN["c"] is None:
+                fresh = _CONN["c"] is None
+                if fresh:
                     _CONN["c"] = _connect(netloc, scheme, timeout)
                 c = _CONN["c"]
                 c.request("GET", path, headers={"Connection": "keep-alive"})
+                if fresh:
+                    note_own_address(c.sock)
                 r = c.getresponse()
                 body = r.read()
                 if r.status != 200:
@@ -210,6 +217,17 @@ def http_json(path, timeout=4):
                 _CONN["c"] = None
                 if attempt:
                     raise
+
+
+def note_own_address(sock):
+    """The address this dashboard polls FROM is not a viewer. On the host that is
+    127.0.0.1, but a containerised dashboard on the Stremio container's network polls
+    from its own address, which would otherwise be listed as a client."""
+    try:
+        ip = sock.getsockname()[0]
+    except Exception:
+        return
+    IGNORE_CLIENT_IPS.add(ip[7:] if ip.startswith("::ffff:") else ip)
 
 
 def esc_html(t):
@@ -235,36 +253,189 @@ def human_addr(a):
 
 
 # ------------------------------------------------------------- container
-_pid_cache = {"pid": None, "at": 0}
+_pid_cache = {"pid": None, "id": "", "why": "", "at": 0}
+_SOCK = {"key": None, "at": 0, "argv": None, "via": "", "why": ""}
 _TAILER = {"proc": None}
+_SELF = {}
+
+
+def first_line(text, default=""):
+    lines = (text or "").strip().splitlines()
+    return lines[0][:160] if lines else default
+
+
+def self_container_id():
+    """This process's own container id, or "" on a plain host.
+
+    Docker bind-mounts /etc/hostname from .../containers/<id>/hostname, which holds
+    even when the hostname was overridden. Only that mount point counts: a HOST's
+    mountinfo also lists .../containers/<id>/mounts/shm for every running container,
+    and matching those would make the host believe it was a container."""
+    if "id" not in _SELF:
+        _SELF["id"] = ""
+        try:
+            with open("/proc/self/mountinfo") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) > 4 and f[4] == "/etc/hostname":
+                        m = re.search(r"/containers/([0-9a-f]{64})/", f[3])
+                        if m:
+                            _SELF["id"] = m.group(1)
+                            break
+        except OSError:
+            pass
+    return _SELF["id"]
+
+
+# Inside a container, 127.0.0.1 is this dashboard, host PIDs are not visible, and
+# nsenter cannot work -- the probe sidecar is the way into Stremio's namespace.
+IN_CONTAINER = os.path.exists("/.dockerenv") or bool(self_container_id())
+
+
+def inspect_container(container):
+    """-> (host pid, full id, bridge gateways, why-not). pid is None when there is
+    nothing to reach, and `why` says whether that is the container or Docker access."""
+    fmt = "{{.State.Pid}} {{.Id}}{{range .NetworkSettings.Networks}} {{.Gateway}}{{end}}"
+    try:
+        r = subprocess.run(["docker", "inspect", "-f", fmt, container],
+                           capture_output=True, text=True, timeout=8)
+    except FileNotFoundError:
+        return None, "", [], "no docker CLI on the dashboard host"
+    except Exception as e:
+        return None, "", [], f"docker inspect failed ({type(e).__name__})"
+    if r.returncode != 0:
+        err = first_line(r.stderr, "docker inspect failed")
+        if "No such" in err:
+            return None, "", [], f"container '{container}' not found"
+        return None, "", [], f"no Docker access: {err}"
+    parts = r.stdout.split()
+    if not parts or not parts[0].isdigit() or int(parts[0]) <= 0:
+        return None, "", [], f"container '{container}' is not running"
+    return (int(parts[0]), parts[1] if len(parts) > 1 else "",
+            [g for g in parts[2:] if g != "<no value>"], "")
 
 
 def container_pid():
-    """Resolve the Stremio container's host PID, and learn its bridge gateway
-    addresses. Traffic from a gateway is this dashboard polling the API, not a
-    viewer -- and the bridge subnet differs per host, so it must be discovered
-    rather than assumed."""
+    """Resolve the ACTIVE Stremio container -> (host pid, full id, why-not), and learn
+    its bridge gateway addresses. Traffic from a gateway is this dashboard polling the
+    API, not a viewer -- and the bridge subnet differs per host, so it must be
+    discovered rather than assumed."""
     with CFG_LOCK:
         container = ACTIVE["container"]
     if not container:
-        return None                      # HTTP-only profile: mode A by definition
+        return None, "", "no container bound - HTTP-only profile"
     now = time.time()
-    if _pid_cache["pid"] and now - _pid_cache["at"] < 30:
-        return _pid_cache["pid"]
+    if now - _pid_cache["at"] < (30 if _pid_cache["pid"] else 5):
+        return _pid_cache["pid"], _pid_cache["id"], _pid_cache["why"]
+    pid, cid, gateways, why = inspect_container(container)
+    IGNORE_CLIENT_IPS.update(g for g in gateways if g)
+    _pid_cache.update(pid=pid, id=cid, why=why, at=now)
+    return pid, cid, why
+
+
+def netns_inode(container):
+    """net:[4026532...] -- the identity of a container's network namespace."""
     try:
-        fmt = "{{.State.Pid}}{{range .NetworkSettings.Networks}} {{.Gateway}}{{end}}"
-        out = subprocess.run(["docker", "inspect", "-f", fmt, container],
-                             capture_output=True, text=True, timeout=8)
-        parts = out.stdout.split()
-        pid = int(parts[0])
-        IGNORE_CLIENT_IPS.update(g for g in parts[1:] if g and g != "<no value>")
-        if pid > 0:
-            _pid_cache.update(pid=pid, at=now)
-            return pid
+        r = subprocess.run(["docker", "exec", container, "readlink", "/proc/self/ns/net"],
+                           capture_output=True, text=True, timeout=8)
+        return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
-        pass
-    _pid_cache.update(pid=None, at=now)
-    return None
+        return ""
+
+
+def find_probe(container, cid):
+    """The probe sidecar: a running container sharing the Stremio container's network
+    namespace (this image with `command: probe`). -> (name, why-not)
+
+    NetworkMode alone is not trusted. A sidecar joined to a container that was later
+    recreated -- watchtower does exactly that -- keeps the OLD namespace alive, and its
+    empty socket table would read as "nobody watching". So a match is confirmed by
+    comparing namespace inodes."""
+    try:
+        ids = subprocess.run(["docker", "ps", "-q", "--no-trunc"],
+                             capture_output=True, text=True, timeout=8).stdout.split()
+        fmt = "{{.Id}}\t{{.Name}}\t{{.HostConfig.NetworkMode}}\t{{json .Config.Cmd}}"
+        r = subprocess.run(["docker", "inspect", "-f", fmt] + ids,
+                           capture_output=True, text=True, timeout=8) if ids else None
+    except Exception as e:
+        return None, f"cannot list containers ({type(e).__name__})"
+    rows = [f for f in (l.split("\t") for l in (r.stdout if r else "").splitlines())
+            if len(f) == 4]
+    running = {f[0] for f in rows} | {f[1].lstrip("/") for f in rows}
+    want, stale = None, []
+    for _id, name, netmode, cmd in rows:
+        if not netmode.startswith("container:"):
+            continue
+        name, target = name.lstrip("/"), netmode.split(":", 1)[1]
+        is_probe = cmd.strip() == '["probe"]'
+        if target not in (cid, container) and not is_probe:
+            continue
+        if want is None:
+            want = netns_inode(container)
+        if want:
+            if netns_inode(name) == want:
+                return name, ""
+            if is_probe and target not in running:
+                stale.append(name)
+        elif target in (cid, container):     # cannot verify: trust the binding
+            return name, ""
+    if stale:
+        return None, (f"probe sidecar '{stale[0]}' is joined to a {container} container "
+                      "that no longer exists - recreate it")
+    return None, "no network-namespace access - add the probe sidecar (see README)"
+
+
+def ss_works(argv):
+    """-> (ok, why-not)"""
+    try:
+        r = subprocess.run(argv + ["-tn", "state", "listening"],
+                           capture_output=True, text=True, timeout=8)
+    except FileNotFoundError:
+        return False, f"{argv[0]} not found"
+    except Exception as e:
+        return False, type(e).__name__
+    return r.returncode == 0, first_line(r.stderr, f"exit {r.returncode}")
+
+
+def netns_access(container, pid, cid):
+    """How to run `ss` inside a Stremio container's network namespace, best first:
+    nsenter from the host, else `docker exec` into the probe sidecar.
+    -> (argv prefix, via, why-not)"""
+    why = ""
+    if not IN_CONTAINER and os.path.exists(f"/proc/{pid}/ns/net"):
+        argv = ["nsenter", "-t", str(pid), "-n", "ss"]
+        ok, err = ss_works(argv)
+        if ok:
+            return argv, "nsenter", ""
+        why = f"nsenter: {err}"
+    name, pwhy = find_probe(container, cid)
+    if not name:
+        return None, "", f"{why}; {pwhy}" if why else pwhy
+    argv = ["docker", "exec", name, "ss"]
+    ok, err = ss_works(argv)
+    if ok:
+        return argv, f"probe {name}", ""
+    return None, "", f"probe sidecar '{name}' cannot run ss ({err})"
+
+
+def socket_source():
+    """-> (argv, via, level, why) for the ACTIVE profile. `level` is the mode achieved
+    when sockets are unavailable: A if the container itself is unreachable, else B.
+
+    A working route is re-checked every 5 min, a missing one every 30s so a sidecar
+    started later is picked up. A failed `ss` run invalidates it at once."""
+    pid, cid, why = container_pid()
+    if not pid:
+        return None, "", "A", why
+    now = time.time()
+    key = (GEN, pid)
+    if _SOCK["key"] == key and now - _SOCK["at"] < (300 if _SOCK["argv"] else 30):
+        return _SOCK["argv"], _SOCK["via"], "B", _SOCK["why"]
+    with CFG_LOCK:
+        container = ACTIVE["container"]
+    argv, via, why = netns_access(container, pid, cid)
+    _SOCK.update(key=key, at=now, argv=argv, via=via, why=why)
+    return argv, via, "B", why
 
 
 SS_KV = re.compile(r"(bytes_acked|bytes_sent|bytes_retrans|delivery_rate|rtt|retrans|"
@@ -273,23 +444,21 @@ SS_KV = re.compile(r"(bytes_acked|bytes_sent|bytes_retrans|delivery_rate|rtt|ret
 
 def read_sockets():
     """Client sockets (with delivered-byte rates) + BT peer dial funnel."""
-    pid = container_pid()
-    if not pid:
-        with CFG_LOCK:
-            bound = bool(ACTIVE["container"])
-        return [], {"error": "container not running" if bound
-                    else "no container bound - HTTP-only profile"}
+    argv, via, level, why = socket_source()
+    if not argv:
+        return [], {"error": why, "level": level}
     try:
-        r = subprocess.run(["nsenter", "-t", str(pid), "-n", "ss", "-tina"],
-                           capture_output=True, text=True, timeout=8)
+        r = subprocess.run(argv + ["-tina"], capture_output=True, text=True, timeout=8)
         if r.returncode != 0:
-            raise RuntimeError((r.stderr or "nsenter failed").strip()[:120])
+            raise RuntimeError(first_line(r.stderr, f"{via}: ss failed"))
         out = r.stdout
     except Exception as e:
-        # Container was replaced (watchtower recreates it on a new pid) or died.
-        _pid_cache.update(pid=None, at=0)
+        # Container was replaced (watchtower recreates it on a new pid) or died, or
+        # the sidecar went away with it. Re-resolve both on the next tick.
+        _pid_cache.update(at=0)
+        _SOCK.update(at=0)
         SOCK_HIST.clear()
-        return [], {"error": str(e)}
+        return [], {"error": str(e), "level": "B"}
 
     clients, funnel = [], defaultdict(int)
     now = time.time()
@@ -366,7 +535,7 @@ def read_sockets():
     return clients, {"established": est, "dialing": dialing,
                      "closing": sum(v for k, v in funnel.items()
                                     if k not in ("ESTAB", "SYN-SENT")),
-                     "by_state": dict(funnel),
+                     "by_state": dict(funnel), "via": via,
                      "hit_rate": (est / (est + dialing)) if (est + dialing) else 0.0}
 
 
@@ -457,6 +626,10 @@ def rdns_worker(q):
             RDNS_PENDING.discard(ip)
 
 
+DOCKER_ERR = re.compile(r"Error response from daemon|Cannot connect to the Docker daemon|"
+                        r"permission denied while trying to connect|No such container")
+
+
 def probe_worker(q):
     """One ffprobe per stream, in the background, to get the REQUIRED bitrate.
 
@@ -467,10 +640,11 @@ def probe_worker(q):
     because players issue non-playback range requests.
 
     Runs inside the container when one is bound -- the stream is always reachable at
-    the container-local port, whatever it is published as. For an HTTP-only profile
-    there is no container to exec into, so it falls back to ffprobe on THIS host
-    against the server URL. That fallback is what makes the verdict work in mode A;
-    without it a remote profile has no required-bitrate figure at all."""
+    the container-local port, whatever it is published as. Otherwise, or when that
+    exec itself fails (no Docker access, no ffprobe in that image), it runs ffprobe on
+    THIS host against the server URL. That fallback is what makes the verdict work in
+    mode A; without it a remote profile has no required-bitrate figure at all. The
+    container image bundles ffprobe for exactly this."""
     ARGS = ["-v", "quiet", "-print_format", "json",
             "-show_entries", "format=duration,bit_rate,size"]
     while True:
@@ -478,28 +652,42 @@ def probe_worker(q):
         key = (ih, idx)
         with CFG_LOCK:
             container, url = ACTIVE["container"], ACTIVE["url"]
+        attempts = [(["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}"], "here")]
         if container:
-            cmd = ["docker", "exec", container, "ffprobe"] + ARGS + \
-                  [f"http://127.0.0.1:11470/{ih}/{idx}"]
-        else:
-            cmd = ["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}"]
+            attempts.insert(0, (["docker", "exec", container, "ffprobe"] + ARGS +
+                                [f"http://127.0.0.1:11470/{ih}/{idx}"], "container"))
         br, err = 0.0, ""
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            fmt = json.loads(r.stdout or "{}").get("format", {})
+        for cmd, where in attempts:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            except FileNotFoundError:
+                # Degrade explicitly: say the tool is missing rather than silently
+                # showing no verdict forever.
+                err = ("no docker CLI" if where == "container"
+                       else "ffprobe not installed on the dashboard host")
+                continue
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"[:120]
+                break
+            # Docker could not run the exec at all. That says nothing about the
+            # stream, so try from here. Any other result is ffprobe's own answer
+            # (it runs with -v quiet, so its stderr is empty), and asking again
+            # elsewhere would only open the stream a second time.
+            if where == "container" and r.returncode != 0 and (
+                    r.returncode in (125, 126, 127) or DOCKER_ERR.search(r.stderr or "")):
+                err = first_line(r.stderr, "docker exec failed")[:120]
+                continue
+            try:
+                fmt = json.loads(r.stdout or "{}").get("format", {})
+            except ValueError:
+                fmt = {}
             if fmt.get("bit_rate"):
                 br = float(fmt["bit_rate"]) / 8.0
             elif fmt.get("size") and fmt.get("duration"):
                 br = float(fmt["size"]) / float(fmt["duration"])
             if not br:
                 err = (r.stderr or "ffprobe returned no bitrate").strip()[:120]
-        except FileNotFoundError:
-            # Degrade explicitly: say the tool is missing rather than silently
-            # showing no verdict forever.
-            err = ("ffprobe not installed on the dashboard host"
-                   if not container else "docker not available")
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"[:120]
+            break
         if br > 0:
             BITRATE[key] = br
             BITRATE_ERR.pop(key, None)
@@ -535,6 +723,12 @@ def cache_stats_container(container):
         'echo $n' % path)
     out = subprocess.run(["docker", "exec", container, "sh", "-c", script],
                          capture_output=True, text=True, timeout=120)
+    if out.returncode == 3:
+        # Stremio creates the directory with its first engine, so on a fresh server
+        # its absence means "nothing cached yet", not a fault.
+        return {"bytes": 0, "entries": 0, "stubs": 0, "dir": path, "via": "container"}
+    if out.returncode != 0:
+        raise RuntimeError(first_line(out.stderr, f"cannot measure {path}"))
     kb, total, held = (int(v) for v in out.stdout.split()[:3])
     return {"bytes": kb * 1024, "entries": held, "stubs": total - held,
             "dir": path, "via": "container"}
@@ -543,7 +737,7 @@ def cache_stats_container(container):
 def cache_worker():
     while True:
         with CFG_LOCK:
-            cache_dir, container = ACTIVE["cache_dir"], ACTIVE["container"]
+            cache_dir, container, gen = ACTIVE["cache_dir"], ACTIVE["container"], GEN
         try:
             if cache_dir:
                 stats = cache_stats_host(cache_dir)
@@ -554,12 +748,17 @@ def cache_worker():
                 # showing a blank tile.
                 stats = {"error": "no container bound - HTTP-only profile",
                          "dir": "(unreachable)"}
-            with STATE_LOCK:
-                STATE["cache"] = stats
         except Exception as e:
-            with STATE_LOCK:
-                STATE["cache"] = {"error": str(e), "dir": cache_dir or "(container)"}
-        time.sleep(60)
+            stats = {"error": str(e), "dir": cache_dir or "(container)"}
+        with STATE_LOCK:
+            if GEN == gen:          # a switch mid-measurement: this is the old server
+                STATE["cache"] = stats
+        # Once a minute, but at once after a server switch: reset_derived() blanks
+        # the tile, and it should not sit on "measuring..." for a minute.
+        for _ in range(30):
+            time.sleep(2)
+            if GEN != gen:
+                break
 
 
 # --------------------------------------------------------- servers / config
@@ -598,7 +797,8 @@ def discover_containers():
     user recognises."""
     try:
         r = subprocess.run(
-            ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}"],
+            ["docker", "ps", "--no-trunc", "--format",
+             "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Command}}"],
             capture_output=True, text=True, timeout=8)
         if r.returncode != 0:
             return {"docker": False, "containers": [],
@@ -612,16 +812,55 @@ def discover_containers():
     out = []
     for line in r.stdout.splitlines():
         f = line.split("\t")
-        if len(f) < 4:
+        if len(f) < 5:
             continue
-        cid, name, image, ports = f[0], f[1], f[2], f[3]
+        cid, name, image, ports, command = f[0], f[1], f[2], f[3], f[4]
         if "stremio" not in f"{name} {image}".lower():
+            continue
+        # This dashboard and its probe sidecar are "stremio-dash" too. The entrypoint
+        # identifies this image however it was tagged; the image name catches a run
+        # with the entrypoint overridden.
+        if command.strip('"').startswith("stremio-dash") or "stremio-dash" in image:
             continue
         hp = published_port(ports, 11470)
         out.append({"id": cid, "name": name, "image": image, "port": hp,
                     "url": f"http://127.0.0.1:{hp}" if hp else "",
                     "ports": ports})
+    if IN_CONTAINER and out:
+        route_from_container(out)
     return {"docker": True, "containers": out, "error": None}
+
+
+def route_from_container(found):
+    """Inside a container, 127.0.0.1 is this dashboard, not the host. Reach a Stremio
+    container over a network shared with it (compose puts a project's services on
+    one) on its own port 11470; failing that, via this container's gateway -- the
+    host -- on the published port. Rewrites each entry's url in place."""
+    me = self_container_id()
+    try:
+        r = subprocess.run(["docker", "inspect"] + ([me] if me else []) +
+                           [c["id"] for c in found],
+                           capture_output=True, text=True, timeout=8)
+        data = json.loads(r.stdout or "[]")
+    except Exception:
+        data = []
+    nets_of = {d.get("Id", ""): (d.get("NetworkSettings") or {}).get("Networks") or {}
+               for d in data}
+    mine = nets_of.get(me, {})
+    if "host" in mine:
+        return                  # host networking: 127.0.0.1 really is the host
+    gateway = next((n.get("Gateway") for n in mine.values() if n.get("Gateway")), "")
+    for c in found:
+        nets = next((v for k, v in nets_of.items() if k.startswith(c["id"])), {})
+        shared = [n for n in nets if n in mine]
+        if shared:
+            # Names only resolve on user-defined networks, not the default bridge.
+            host = c["name"] if shared[0] != "bridge" else nets[shared[0]].get("IPAddress")
+            c["url"] = f"http://{host}:11470" if host else ""
+        elif c["port"] and gateway:
+            c["url"] = f"http://{gateway}:{c['port']}"
+        else:
+            c["url"] = ""
 
 
 def resolve_discovered(container_id):
@@ -633,18 +872,6 @@ def resolve_discovered(container_id):
         if c["id"] == container_id or c["name"] == container_id:
             return c["name"]
     raise ValueError("that container is no longer running")
-
-
-def _probe_pid(container):
-    """Container PID without touching the live _pid_cache or IGNORE_CLIENT_IPS --
-    this runs against servers that are not the active one."""
-    try:
-        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", container],
-                           capture_output=True, text=True, timeout=8)
-        pid = int((r.stdout or "0").strip() or 0)
-        return pid or None
-    except Exception:
-        return None
 
 
 def probe_server(url, container=""):
@@ -681,20 +908,19 @@ def probe_server(url, container=""):
 
     info.update(ok=True, version=vals.get("serverVersion"), mode="A")
     if container:
-        pid = _probe_pid(container)
+        # Deliberately not container_pid(): that caches for, and learns gateways of,
+        # the ACTIVE profile, and this may be a different one.
+        pid, cid, _gw, why = inspect_container(container)
         if not pid:
-            info["notes"].append(f"container '{container}' is not running - HTTP only")
+            info["notes"].append(f"{why} - HTTP only")
         else:
             info["mode"] = "B"
-            try:
-                rr = subprocess.run(["nsenter", "-t", str(pid), "-n", "ss", "-tin"],
-                                    capture_output=True, text=True, timeout=8)
-                if rr.returncode == 0:
-                    info["mode"] = "C"
-                else:
-                    info["notes"].append("no netns access - no clients or dial funnel")
-            except Exception:
-                info["notes"].append("nsenter unavailable - no clients or dial funnel")
+            argv, via, why = netns_access(container, pid, cid)
+            if argv:
+                info["mode"] = "C"
+                info["notes"].append(f"sockets via {via}")
+            else:
+                info["notes"].append(f"{why} - no clients or dial funnel")
     return info
 
 
@@ -746,7 +972,8 @@ def reset_derived():
     for d in (HIST, PLAYHEAD, NEEDS, SOCK_HIST, BITRATE, BITRATE_ERR,
               BITRATE_TRIED, RDNS, RDNS_PENDING):
         d.clear()
-    _pid_cache.update(pid=None, at=0)
+    _pid_cache.update(pid=None, id="", why="", at=0)
+    _SOCK.update(key=None, at=0, argv=None, via="", why="")
     IGNORE_CLIENT_IPS.clear()
     IGNORE_CLIENT_IPS.add("127.0.0.1")
     proc = _TAILER.get("proc")          # unblock the tailer from the old container
@@ -955,14 +1182,8 @@ def collect():
             # container that is not running buys nothing, and saying "B" then would
             # be exactly the kind of unsupported claim this dashboard avoids.
             with CFG_LOCK:
-                bound, sname = bool(ACTIVE["container"]), ACTIVE["name"]
-            ferr = funnel.get("error") or ""
-            if not bound or "not running" in ferr:
-                mode = "A"
-            elif not ferr:
-                mode = "C"
-            else:
-                mode = "B"
+                sname = ACTIVE["name"]
+            mode = funnel.get("level", "B") if funnel.get("error") else "C"
             with STATE_LOCK:
                 STATE.update(ok=True, error=None, ts=t0, engines=engines,
                              clients=clients, funnel=funnel, settings=st,
@@ -975,8 +1196,14 @@ def collect():
                     NEEDS.pop(ih, None)
                     det_cache.pop(ih, None)
         except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            with CFG_LOCK:
+                host = urllib.parse.urlsplit(ACTIVE["url"]).hostname or ""
+            if IN_CONTAINER and host in ("127.0.0.1", "localhost", "::1"):
+                err += (" - inside a container, 127.0.0.1 is this dashboard, not the "
+                        "host. Set STREMIO_URL or pick the server from the gear menu.")
             with STATE_LOCK:
-                STATE.update(ok=False, error=f"{type(e).__name__}: {e}", ts=t0)
+                STATE.update(ok=False, error=err, ts=t0)
 
         time.sleep(max(0.5, POLL - (time.time() - t0)))
 
@@ -993,6 +1220,51 @@ except ValueError as _e:
           flush=True)
     with STATE_LOCK:
         STATE.update(ok=False, error=f"config: {_e}")
+
+
+def bootstrap():
+    """First start with no config on disk -- the normal first run of the container.
+    If exactly one Stremio container is visible and answers, make it the active
+    profile instead of the built-in 127.0.0.1 default, which inside a container
+    points at this dashboard. Anything ambiguous is left for the gear menu.
+
+    Retries with backoff: compose's depends_on only waits for the Stremio container
+    to START, and its server takes a few seconds more to answer. It stops as soon as
+    a config exists, whether this wrote it or the gear menu did."""
+    said, delay = set(), 3
+    while not CFG.get("_path") and not any(ENV_PINNED.values()):
+        found = [c for c in discover_containers().get("containers") or [] if c["url"]]
+        if len(found) == 1:
+            c = found[0]
+            probe = probe_server(c["url"], c["name"])
+            if probe.get("ok"):
+                break
+            msg = f"{c['name']} at {c['url']} is not answering yet ({probe.get('error')})"
+        elif found:
+            msg = f"{len(found)} Stremio containers found - choose one from the gear menu"
+        else:
+            msg = "no Stremio container visible - waiting for one, or use the gear menu"
+        if msg not in said:
+            said.add(msg)
+            print(f"bootstrap: {msg}", flush=True)
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+    else:
+        return
+    with CFG_LOCK:
+        if CFG.get("_path"):          # the gear menu got there first
+            return
+        srv = find_server(CFG, CFG.get("active")) or CFG["servers"][0]
+        srv.update(name=c["name"], url=probe["url"], container=c["name"])
+        CFG["active"] = srv["id"]
+        try:
+            save_config(CFG)
+        except Exception as e:
+            print(f"bootstrap: config not saved ({e}); using it for this run only",
+                  flush=True)
+    set_active(srv)
+    print(f"bootstrap: using {c['name']} at {probe['url']} (mode {probe['mode']})",
+          flush=True)
 
 
 # ------------------------------------------------------------------ http
@@ -1222,6 +1494,7 @@ if __name__ == "__main__":
     threading.Thread(target=collect, daemon=True).start()
     threading.Thread(target=log_tailer, daemon=True).start()
     threading.Thread(target=cache_worker, daemon=True).start()
+    threading.Thread(target=bootstrap, daemon=True).start()
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     srv.daemon_threads = True
     print(f"stremio-dash on http://{LISTEN_HOST}:{LISTEN_PORT}  -> "

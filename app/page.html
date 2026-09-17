@@ -418,9 +418,10 @@ async function tick(){
       <div class="x">${es.length} engine${es.length===1?'':'s'} loaded</div></div>
     <div class="tile"><div class="k">Clients</div><div class="v num">${cl.length}</div>
       <div class="x">${esc(cl.map(c=>c.name||c.ip).join(', ')||'none connected')}</div></div>
-    <div class="tile"><div class="k">Peer dial funnel</div>
-      <div class="v num">${f.established||0} <span style="color:var(--mut);font-size:14px">/ ${(f.established||0)+(f.dialing||0)}</span></div>
-      <div class="x">${((f.hit_rate||0)*100).toFixed(1)}% of dials connect &middot; ${f.dialing||0} dialing now</div></div>
+    <div class="tile"><div class="k">Peer dial funnel</div>${f.error
+      ?`<div class="v num" style="color:var(--mut)">—</div><div class="x">unavailable: ${esc(f.error)}</div>`
+      :`<div class="v num">${f.established||0} <span style="color:var(--mut);font-size:14px">/ ${(f.established||0)+(f.dialing||0)}</span></div>
+      <div class="x">${((f.hit_rate||0)*100).toFixed(1)}% of dials connect &middot; ${f.dialing||0} dialing now</div>`}</div>
     <div class="tile"><div class="k">Cache</div>
       <div class="v num">${cache.bytes!=null?B(cache.bytes):'—'}${cap?`<span style="color:var(--mut);font-size:14px"> / ${B(cap)}</span>`:''}</div>
       <div class="x">${cache.entries!=null?`${cache.entries} cached${cap?` &middot; ${(100*cache.bytes/cap).toFixed(0)}% of cap`:''}`
@@ -527,8 +528,8 @@ function renderDisc(){
     <div class="who">
       <div class="nm">${esc(c.name)}${known.has(c.name)?' <span class="b off">already added</span>':''}</div>
       <div class="ur">${esc(c.image)}</div>
-      <div class="sub">${c.url?esc(c.url)+' &middot; full mode C available'
-        :'port 11470 is not published &mdash; enter a URL manually'}</div>
+      <div class="sub">${c.url?esc(c.url)+' &middot; Docker signals available &mdash; Test shows the exact mode'
+        :'no route to its port 11470 from the dashboard &mdash; enter a URL manually'}</div>
     </div>
     <div class="acts">${c.url
       ?`<button class="btn" data-act="use" data-id="${esc(c.id)}">Use this</button>`:''}</div>
@@ -538,7 +539,7 @@ function renderDisc(){
 function renderChoices(){
   const sel=document.getElementById('fcont'), cs=(M.disc&&M.disc.containers)||[];
   sel.innerHTML='<option value="">No container &mdash; HTTP only (mode A)</option>'+
-    cs.map(c=>`<option value="${esc(c.id)}">Bind to ${esc(c.name)} &mdash; full mode C</option>`).join('');
+    cs.map(c=>`<option value="${esc(c.id)}">Bind to ${esc(c.name)} &mdash; mode B or C</option>`).join('');
 }
 
 function showResult(r){
