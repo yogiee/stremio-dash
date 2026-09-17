@@ -16,5 +16,8 @@ Requires Python 3.9+ on the target, and either root or passwordless sudo -- `nse
 needs privileges and the unit file lands in `/etc/systemd/system`. `install.sh` escalates
 only where it has to, and leaves `$DEST` root-owned.
 
-`ffprobe` must exist **inside the Stremio container**, not on the host: the required-bitrate
-probe runs as `docker exec <container> ffprobe` against the container-local stream URL.
+`ffprobe` is looked for **inside the Stremio container** first, as
+`docker exec <container> ffprobe` against the container-local stream URL. If that exec cannot
+run at all, the dashboard falls back to `ffprobe` on the host.
+
+For the container image instead, see "Run with Docker" in the top-level README.

@@ -1,0 +1,49 @@
+# stremio-dash beside an existing Stremio server.
+#
+# Merge the two stremio-dash services into the compose file that already runs your
+# Stremio server, and rename `stremio` below to that service's name. The `stremio`
+# service here is only an example so this file also works on its own.
+#
+# What each piece buys is in docs/modes.md. In short:
+#   no socket, no probe  -> mode A: swarm, peers, trackers, bitrate verdict
+#   + docker.sock        -> mode B: + playhead, seeks, cache usage
+#   + probe sidecar      -> mode C: + clients, delivered rates, dial funnel, runway
+
+services:
+  stremio:
+    image: tsaridas/stremio-docker:latest
+    restart: unless-stopped
+    ports:
+      - "11470:11470"
+      - "12470:12470"
+    volumes:
+      - ./stremio-server:/root/.stremio-server
+
+  stremio-dash:
+    # Pin a release (e.g. :1.0.0) if something like watchtower updates your containers.
+    image: ghcr.io/yogiee/stremio-dash:latest
+    restart: unless-stopped
+    ports:
+      - "9481:9481"
+    volumes:
+      - ./stremio-dash:/config
+      # Read access alone is not possible: anything that can reach this socket
+      # controls the Docker host. See README ("Docker access") before mounting it.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # No STREMIO_URL / STREMIO_CONTAINER needed: on first start the dashboard binds
+    # to the one Stremio container it finds. Setting them pins the server instead.
+    cpu_shares: 256        # always loses to playback on a small host
+    depends_on:
+      - stremio
+
+  stremio-dash-probe:
+    # Same image, idling inside the Stremio container's network namespace, so the
+    # dashboard can read its sockets without host root. Compose recreates it along
+    # with `stremio`; anything that recreates only `stremio` (watchtower) strands it
+    # in the old namespace, and the dashboard says so.
+    image: ghcr.io/yogiee/stremio-dash:latest
+    command: probe
+    network_mode: "service:stremio"
+    restart: unless-stopped
+    depends_on:
+      - stremio

@@ -1,0 +1,104 @@
+name: image
+
+# Builds and tests the container image on every push and pull request, and publishes
+# it to GHCR only for a version tag (v1.2.3). `latest` therefore moves on releases,
+# never on a plain push -- anything auto-updating from :latest only ever sees releases.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/stremio-dash
+  RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax check
+        run: |
+          python3 -m py_compile app/stremio_dash.py
+          sh -n deploy/docker-entrypoint.sh
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      # Native-architecture build, loaded locally, so nothing is published untested.
+      - name: Build for testing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: stremio-dash:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run --rm stremio-dash:ci ffprobe -version | head -1
+          docker run --rm stremio-dash:ci docker --version
+          docker run --rm stremio-dash:ci ss -V
+
+      # The acceptance bar for the container: next to a real Stremio server it must
+      # find that server unaided and reach mode C through the probe sidecar. No
+      # playback is needed for that -- mode C means the socket table is readable.
+      - name: Mode C against a real Stremio server
+        run: |
+          docker network create ci
+          docker run -d --name stremio --network ci tsaridas/stremio-docker:latest
+          docker run -d --name dash --network ci -p 9481:9481 \
+            -v /var/run/docker.sock:/var/run/docker.sock stremio-dash:ci
+          docker run -d --name probe --network container:stremio stremio-dash:ci probe
+          for i in $(seq 1 60); do
+            mode=$(curl -sf http://127.0.0.1:9481/api/state \
+                   | python3 -c 'import json,sys; print(json.load(sys.stdin)["mode"])' || true)
+            [ "$mode" = C ] && break
+            sleep 3
+          done
+          curl -s http://127.0.0.1:9481/api/state | python3 -m json.tool | head -40
+          docker logs dash
+          [ "$mode" = C ] || { echo "::error::expected mode C, got '$mode'"; exit 1; }
+          curl -sf -o /dev/null http://127.0.0.1:9481/        # 500 if page.html is missing
+          docker exec dash stremio-dash health
+          docker exec probe stremio-dash health
+
+      - name: Clean up test containers
+        if: always()
+        run: docker rm -f dash probe stremio || true
+
+      - uses: docker/login-action@v4
+        if: env.RELEASE == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      # amd64 and arm64 are both required: a common host for this is a Raspberry Pi.
+      - name: Build (and on a version tag, publish)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.RELEASE == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

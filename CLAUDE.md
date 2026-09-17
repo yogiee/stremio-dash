@@ -52,6 +52,17 @@ These were all established empirically against a live server. Re-deriving them i
 - There is **no playback-position signal anywhere**: `selections` stays `[]`, and clients hold
   **one long-lived connection** rather than re-requesting. Position must be derived as
   `connection start offset + socket bytes_acked`; both reset together on reconnect.
+- **Engine lifecycle** (read from `server.js` 4.20.x):
+  - An engine is destroyed **120 s after its last stream connection closes**.
+  - Its swarm only pauses once the file is **fully cached**.
+  - So a switched-away stream keeps downloading for two minutes by design. It keeps going
+    for as long as a player leaks the old connection, which has been seen at ~66 min.
+- `GET /{ih}/remove` destroys an engine but **never deletes cached data**. There is no pause
+  endpoint and no clear-cache endpoint.
+- **Any `GET /{ih}/{idx}` creates the engine**, including our own ffprobe. `stats.json`
+  requests do not.
+- The server closes an idle keep-alive connection after ~5 s. Our 2 s poll keeps ours open.
+- The Stremio log carries **no client IP**. Only the socket table knows who is connected.
 
 **Reading the log**
 - Range requests appear in **two shapes**: `-> GET /<ih>/<idx> bytes=N-` and
@@ -91,6 +102,27 @@ These were all established empirically against a live server. Re-deriving them i
 - Stremio leaves an empty infohash directory behind on eviction, so most cache entries are
   stubs. Count only directories holding data.
 
+**Running in a container**
+- Inside a container, **127.0.0.1 is the dashboard**, not the host. Discovery rewrites a
+  Stremio container's URL to its name on a shared network (its IP on the default bridge,
+  where names do not resolve), or to our gateway plus the published port.
+- Container detection is `/.dockerenv`, or the **source of the `/etc/hostname` mount**.
+  Never match any `/containers/<id>/` in mountinfo: a *host* lists every running
+  container's shm mount there and would believe it was a container.
+- On a shared network, the dashboard's own polling connection shows up in `ss` as a
+  client. `note_own_address()` ignores whatever address the keep-alive socket was bound to.
+- `NetworkMode: container:X` is not proof of a live sidecar. After X is recreated, the
+  sidecar still holds X's **old** namespace, and its empty socket table reads as
+  "nobody watching". Compare `readlink /proc/self/ns/net` in both.
+  `--network container:<name>` is stored as the full id.
+- `depends_on` waits for the Stremio container to start, not to answer. First-start
+  binding must retry.
+- Discovery matches "stremio" in names and images, and that includes this image's own
+  containers. Exclude them by entrypoint and image name.
+- If Docker Desktop containers get **connection refused from every LAN host**, check macOS
+  Local Network permission for Docker first. An OS update reset it once.
+- There is no buildx on the dev Mac, and the legacy builder rejects `COPY --chmod`.
+
 **UI**
 - **Never rebuild the card DOM on a tick.** Update in place via `data-r` slots. Re-rendering
   `innerHTML` destroys and recreates `<details>`, so panels flap open/closed.
@@ -107,10 +139,17 @@ These were all established empirically against a live server. Re-deriving them i
 
 ```
 app/{stremio_dash.py,page.html}   collector + UI
+Dockerfile, compose.yaml          container image (roles: serve, probe) + example stack
+deploy/docker-entrypoint.sh       the image's entrypoint
 deploy/install.sh                 systemd install, HOST= and DEST= parameterised
+.github/workflows/image.yml       build + mode-C test on push; GHCR publish on vX.Y.Z tags
 docs/{modes.md,ROADMAP.md}        capability matrix + remaining work
+docs/plan-combined-image.md       Stremio server + dashboard in one image (on hold)
 config.example.json               committed; config.json is not
 ```
+
+`.dockerignore` is a **whitelist**. Anything the image needs must be added there explicitly.
+That is deliberate: the working tree holds files that must never ship.
 
 ## Where to start
 

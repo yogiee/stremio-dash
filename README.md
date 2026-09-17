@@ -37,16 +37,58 @@ server is never told play/pause.
 
 - A Stremio streaming server (the one bundled with Stremio Desktop, or a container
   image such as `tsaridas/stremio-docker`)
-- Python 3.9+ — no third-party packages
-- `ffprobe` for the bitrate verdict — inside the Stremio container when the dashboard is
-  bound to one, otherwise on the dashboard host
+- Either Docker, for the container image, or Python 3.9+ with no third-party packages
 - Optional: Docker access to the Stremio container for the deeper signals
 
 See [docs/modes.md](docs/modes.md) for exactly what each level of access buys you.
 
+## Run with Docker
+
+The image is `ghcr.io/yogiee/stremio-dash`, for `linux/amd64` and `linux/arm64`.
+
+Copy the two `stremio-dash` services from [`compose.yaml`](compose.yaml) into the compose
+file that already runs your Stremio server, rename `stremio` in them to that service's
+name, and `docker compose up -d`. Then open `http://<host>:9481`.
+
+There is nothing to configure for the common case. On first start, with no config yet,
+the dashboard binds to the one Stremio container it can see, waits for it to answer, and
+saves that to `/config/config.json`. If it sees several, pick one from the gear menu.
+
+| you add | you get |
+|---|---|
+| nothing but `STREMIO_URL=http://<server>:11470` | mode A: swarm, peers, trackers, bitrate verdict |
+| the Docker socket | mode B: + playhead, seeks, cache usage |
+| the `stremio-dash-probe` sidecar | mode C: + clients, delivered rates, dial funnel, runway |
+
+The probe is the same image run as `command: probe` inside the Stremio container's network
+namespace (`network_mode: "service:<stremio>"`, or `--network container:<name>` for a
+Stremio started with `docker run`). The dashboard runs `ss` in it over `docker exec`: the
+per-client byte counters exist only in that namespace, and there is no `ss` in the
+Stremio image. If only the Stremio container is recreated, as watchtower does, the probe
+is left behind in the old namespace. The dashboard detects that and says so, and
+`docker compose up -d` puts it right.
+
+`ffprobe` is bundled. It is used when no container is bound, or when the Stremio image
+has none of its own. It is also most of the image's ~280 MB.
+
+### Docker access
+
+Mounting `/var/run/docker.sock` gives the dashboard control of the Docker host. That is
+root-equivalent, and `:ro` does not change it: that flag protects the socket *file*, not
+the API behind it. The dashboard itself only runs `docker ps`, `inspect`, `logs` and
+`exec` against Stremio and its probe, and it never takes a container name from the
+browser. It has no authentication, though, so keep it on your LAN.
+
+A socket proxy such as `tecnativa/docker-socket-proxy` with `CONTAINERS=1`, reached via
+`DOCKER_HOST=tcp://<proxy>:2375`, narrows that to reading containers and their logs. The
+playhead and seek tracking still work. Cache usage, the probe sidecar and the in-container
+ffprobe do not, because `docker exec` is a `POST`, and allowing `POST` hands most of that
+power straight back.
+
 ## Configure
 
-Copy `config.example.json` to `config.json` and set the server URL:
+The container writes its config to `/config/config.json`. Run directly, copy
+`config.example.json` to `config.json` next to the script and set the server URL:
 
 ```json
 {
@@ -79,7 +121,7 @@ there is no authentication, and a container name is handed to `docker exec`, so 
 never accepted as free text. URLs are free text because they only ever reach an HTTP
 client. Docker socket paths, cache directories and poll intervals stay file-only.
 
-## Run
+## Run without Docker
 
 ```bash
 python3 app/stremio_dash.py
@@ -87,12 +129,14 @@ python3 app/stremio_dash.py
 
 Then open `http://<host>:9481`.
 
-For a systemd service, see [`deploy/`](deploy/).
+For a systemd service, see [`deploy/`](deploy/). Running on the Docker host itself is the
+one way to get mode C without a sidecar: it reaches the Stremio container's network
+namespace with `nsenter`, which needs root.
 
 ## Status
 
-Working and in daily use, with multi-server switching. The container image is the
-remaining work — see the roadmap in `docs/`.
+Working and in daily use, with multi-server switching and a container image. See the
+roadmap in `docs/` for what is next.
 
 ## Licence
 

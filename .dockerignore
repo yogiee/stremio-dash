@@ -1,8 +1,8 @@
-.git
-.github
-docs
-deploy
-config.json
-*.bak*
-__pycache__
-.DS_Store
+# Whitelist: nothing enters the build context unless named here. The working tree
+# holds files that must never ship (config.json, NOTES.homelab.md, deploy credentials),
+# and a deny-list only protects against the ones someone remembered to list.
+*
+!app/stremio_dash.py
+!app/page.html
+!config.example.json
+!deploy/docker-entrypoint.sh
