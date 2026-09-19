@@ -15,7 +15,9 @@ deleting cached data.
 
 **Per stream** — title, size, % cached, progress bar with playhead marker, swarm ingest
 speed with a rolling sparkline, connected / unchoked / queued / known peers, swarm size,
-dial attempts, a tracker health table, and a peer table with reverse DNS.
+dial attempts, a tracker health table, and a peer table with reverse DNS. For a season
+pack, the figures follow the episode actually being played, read from the server log.
+Without the log (mode A) the card says it cannot tell which episode that is.
 
 **The verdict** — the number no Stremio client gives you:
 
@@ -30,9 +32,11 @@ at half the required rate.
 inbound-connectable port, so it only ever reaches peers it dials out to; this makes
 that visible.
 
-**Clients** — which devices are connected, their delivered rate, and whether each is
-streaming, serving from cache, or idle. Inferred from the socket, because the streaming
-server is never told play/pause.
+**Clients** — which devices are connected (one row per address, however many
+connections it holds), their delivered rate, and whether each is streaming, serving from
+cache, or idle. Inferred from the socket, because the streaming server is never told
+play/pause. "From cache" means the file being read is completely on disk, not merely that
+no peers are sending.
 
 ## What it can do
 

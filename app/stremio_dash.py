@@ -12,7 +12,7 @@ Sources, in descending order of portability:
   1. GET /stats.json            - per-engine swarm stats, trackers, wires (peers)
   2. GET /{ih}/{idx}/stats.json - streamName / streamLen / streamProgress
   3. ffprobe over HTTP          - the bitrate playback actually requires
-  4. docker logs -f             - range requests -> playhead byte offset, seeks
+  4. docker logs -f             - range requests -> which file plays, playhead, seeks
   5. ss -tina in the netns      - client sockets (real LAN IPs) + peer dial funnel
 
 Only 1-3 work against a Stremio server on another host; 4 needs Docker access and
@@ -125,6 +125,8 @@ STATE = {
 HIST     = defaultdict(lambda: deque(maxlen=HISTORY))   # infohash -> samples
 PLAYHEAD = {}                                            # infohash -> playhead info
 NEEDS    = {}                                            # infohash -> consumption-rate state
+FILE_LEN = {}                                            # (infohash, idx) -> bytes
+FILES_SEEN = threading.Event()     # the collector has read /stats.json at least once
 SOCK_HIST = defaultdict(lambda: deque(maxlen=150))       # socket key -> [(t, bytes_acked)]
 # A player reads in bursts: it drains its buffer, then refills in one gulp and goes
 # quiet. Measured on a real iPad playing a cached 1080p file, bursts were ~8.9 MB
@@ -145,6 +147,10 @@ BITRATE_TRIED = {}    # (infohash, idx) -> (last attempt ts, delay before the ne
 # another 120s. Retrying at a fixed 120s could therefore hold a stalled engine open
 # forever, so a failing probe backs off.
 PROBE_RETRY_MIN, PROBE_RETRY_MAX = 120, 1800
+# Our ffprobe lands in the server log exactly like a player's range request. Tagging
+# its URL lets the log tailer skip it, including in the backlog replayed after a
+# restart; otherwise a probe would move the playhead or switch the file being shown.
+PROBE_TAG = "stremio-dash=probe"
 
 IH_RE = re.compile(r"^[0-9a-f]{40}$")
 # Engines this dashboard stopped -> when. Any GET /{ih}/{idx} re-creates an engine, so
@@ -557,11 +563,53 @@ def read_sockets():
                      "hit_rate": (est / (est + dialing)) if (est + dialing) else 0.0}
 
 
+def by_device(socks):
+    """One row per client address, in the order ss lists them.
+
+    A player does not keep to one connection: one stalled on a file that is still
+    downloading re-requests every ~15s on a fresh socket, and the server holds the old
+    ones open, so a single device can own several. Clients behind one proxy share an
+    address and merge too -- they were indistinguishable already."""
+    rows = {}
+    for s in socks:
+        d = rows.get(s["ip"])
+        if d is None:
+            rows[s["ip"]] = dict(s, conns=1)
+            continue
+        d["conns"] += 1
+        for k in ("bytes_acked", "delivered_bps", "sendq"):
+            d[k] = d.get(k, 0) + s.get(k, 0)
+        d["retrans"] = str(int(d.get("retrans") or 0) + int(s.get("retrans") or 0))
+        d["active"] = d.get("active", False) or s.get("active", False)
+        if s["state"] == "ESTAB":
+            d["state"] = "ESTAB"
+        if s.get("idle_for", 1e9) < d.get("idle_for", 1e9):
+            # RTT and ports belong to the connection that most recently moved bytes.
+            d.update({k: s[k] for k in ("idle_for", "rtt", "port", "via") if k in s})
+    return list(rows.values())
+
+
 # ------------------------------------------------------------- log tail
 # The server logs range requests in two shapes depending on whether the client
 # sent a query string:  "-> GET /<ih>/<idx> bytes=N-"  and  "... /<idx>? bytes=N-".
 # The Stremio apps use the second; a bare curl produces the first. Match both.
-LOG_RE = re.compile(r"-> GET /([0-9a-f]{40})/(\d+)(?:\?\S*)?\s+bytes=(\d+)-")
+LOG_RE = re.compile(r"-> GET /([0-9a-f]{40})/(\d+)(\?\S*)?\s+bytes=(\d+)-(\d*)")
+# A player opens a file with a burst: the header, the index at the END of the file
+# (MKV cues, an MP4's moov) -- often as a pair of requests -- and then ONE open-ended
+# request from where it resumes, held as a single long connection. So a bounded range
+# or a read of the file's tail is never the position, and the last request that is
+# neither IS the position, however far it jumped. The old rule ("believe a far jump
+# only after a second request nearby") got both wrong: it accepted the paired tail
+# reads and threw away the lone resume request, parking the playhead at 99.9%.
+TAIL_ZONE_MIN = 16 * 1024 * 1024
+SEEK_GAP = 64 * 1024 * 1024
+
+
+def is_index_read(ih, idx, start, end):
+    n = FILE_LEN.get((ih, idx))
+    return bool(end) or (bool(n) and start >= n - max(TAIL_ZONE_MIN, n // 200))
+
+
 # docker logs -t prefixes RFC3339Nano UTC; we need the real time of each request so a
 # replayed backlog does not look like it just happened.
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z\s")
@@ -577,8 +625,13 @@ def log_time(line, fallback):
         return fallback
 
 
+def new_playhead(idx, start, now):
+    return {"idx": idx, "offset": start, "at": now, "seeks": 0, "cand_idx": None}
+
+
 def log_tailer():
-    """Follow the container log for range requests -> playhead byte offset."""
+    """Follow the container log for range requests -> which file is playing, and the
+    playhead byte offset within it."""
     while True:
         with CFG_LOCK:
             container, gen = ACTIVE["container"], GEN
@@ -586,6 +639,10 @@ def log_tailer():
             time.sleep(3)                # HTTP-only profile: no log to follow
             continue
         p = None
+        # Telling an index read from playback needs file lengths, which come from the
+        # collector's /stats.json. Wait briefly for them, or the replayed backlog below
+        # would be read without them.
+        FILES_SEEN.wait(10)
         try:
             p = subprocess.Popen(
                 # Replay recent history so a dashboard restart mid-stream does not
@@ -597,27 +654,32 @@ def log_tailer():
                 if GEN != gen:           # switched servers: this log is now the wrong one
                     break
                 m = LOG_RE.search(line)
-                if not m:
+                if not m or PROBE_TAG in (m.group(3) or ""):
                     continue
-                ih, idx, start = m.group(1), int(m.group(2)), int(m.group(3))
+                ih, idx, start = m.group(1), int(m.group(2)), int(m.group(4))
+                index = is_index_read(ih, idx, start, m.group(5))
                 now = log_time(line, time.time())
                 cur = PLAYHEAD.get(ih)
+                if cur and idx != cur["idx"]:
+                    # Another file of the same torrent: a season pack moving on to the
+                    # next episode. Offsets in two files are not comparable, so this is
+                    # a new position, not a seek. A player opening a file sends several
+                    # requests at once; a lone one (a next-episode preload, say) must
+                    # not move the card to a file nobody is watching, because a player
+                    # holding one long connection may never re-request the real one.
+                    if cur.get("cand_idx") != idx:
+                        cur["cand_idx"] = idx
+                        continue
+                    cur = None
                 if not cur:
-                    PLAYHEAD[ih] = {"idx": idx, "offset": start, "at": now,
-                                    "seeks": 0, "cand": None}
+                    PLAYHEAD[ih] = new_playhead(idx, 0 if index else start, now)
                     continue
-                gap = abs(start - cur["offset"])
-                if gap > 64 * 1024 * 1024:
-                    # A lone far-away request is almost always the player reading the
-                    # container index at the end of the file, not a seek. Require a
-                    # second request nearby before believing the position moved.
-                    cand = cur.get("cand")
-                    if cand is not None and abs(start - cand) <= 64 * 1024 * 1024:
-                        cur.update(offset=start, at=now, seeks=cur["seeks"] + 1, cand=None)
-                    else:
-                        cur["cand"] = start
-                else:
-                    cur.update(offset=start, at=now, cand=None)
+                cur["cand_idx"] = None
+                if index:
+                    continue
+                if abs(start - cur["offset"]) > SEEK_GAP:
+                    cur["seeks"] += 1
+                cur.update(offset=start, at=now)
         except Exception:
             time.sleep(5)
         finally:
@@ -672,10 +734,11 @@ def probe_worker(q):
             continue            # queued before the stop: probing would re-create it
         with CFG_LOCK:
             container, url = ACTIVE["container"], ACTIVE["url"]
-        attempts = [(["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}"], "here")]
+        attempts = [(["ffprobe"] + ARGS + [f"{url}/{ih}/{idx}?{PROBE_TAG}"], "here")]
         if container:
             attempts.insert(0, (["docker", "exec", container, "ffprobe"] + ARGS +
-                                [f"http://127.0.0.1:11470/{ih}/{idx}"], "container"))
+                                [f"http://127.0.0.1:11470/{ih}/{idx}?{PROBE_TAG}"],
+                                "container"))
         br, err = 0.0, ""
         for cmd, where in attempts:
             try:
@@ -841,7 +904,7 @@ def save_names(force=False):
 def forget_engine(ih):
     for d in (HIST, PLAYHEAD, NEEDS):
         d.pop(ih, None)
-    for d in (BITRATE, BITRATE_ERR, BITRATE_TRIED):
+    for d in (BITRATE, BITRATE_ERR, BITRATE_TRIED, FILE_LEN):
         for k in [k for k in d if k[0] == ih]:
             d.pop(k, None)
     with STATE_LOCK:
@@ -1183,7 +1246,7 @@ def reset_derived():
         except Exception:
             pass
         _CONN.update(c=None, netloc=None)
-    for d in (HIST, PLAYHEAD, NEEDS, SOCK_HIST, BITRATE, BITRATE_ERR,
+    for d in (HIST, PLAYHEAD, NEEDS, FILE_LEN, SOCK_HIST, BITRATE, BITRATE_ERR,
               BITRATE_TRIED, RDNS, RDNS_PENDING, STOPPED):
         d.clear()
     _pid_cache.update(pid=None, id="", why="", at=0)
@@ -1240,12 +1303,24 @@ def main_file_idx(files):
     return max(range(len(files)), key=lambda i: files[i].get("length", 0))
 
 
+def playing_idx(ph, files):
+    """-> (file index, known). The file a client last opened, as the log says.
+
+    In a season pack the largest file is just the longest episode, so it is only a
+    fallback for when no request has been seen -- and mode A has no log at all. Showing
+    it as though it were playing once reported one episode "fully cached" while
+    another was stalling."""
+    if ph and 0 <= ph["idx"] < len(files):
+        return ph["idx"], True
+    return main_file_idx(files), len(files) <= 1
+
+
 def collect():
     import queue
     rq = queue.Queue()
     pq = queue.Queue()
     threading.Thread(target=probe_worker, args=(pq,), daemon=True).start()
-    det_cache = {}          # ih -> (fetched_at, detail json)
+    det_cache = {}          # ih -> (fetched_at, file idx, detail json)
     set_cache = {"at": 0.0, "v": {}}
     if DO_RDNS:
         threading.Thread(target=rdns_worker, args=(rq,), daemon=True).start()
@@ -1262,13 +1337,23 @@ def collect():
             engines = {}
             for ih, s in raw.items():
                 files = s.get("files") or []
-                idx = main_file_idx(files)
+                for i, f in enumerate(files):
+                    FILE_LEN[(ih, i)] = f.get("length") or 0
+                # Read once: the tailer replaces this dict when playback moves to
+                # another file, so it cannot disagree with the index taken from it.
+                ph = PLAYHEAD.get(ih)
+                idx, known = playing_idx(ph, files)
+                if ph and ph["idx"] != idx:
+                    ph = None                    # a position in a file we cannot show
                 prev = det_cache.get(ih)
-                det = prev[1] if prev else {}
-                if idx is not None and (prev is None or t0 - prev[0] >= DETAIL_SEC):
+                # Detail is per FILE: once playback moves to another file, the last
+                # one's progress must not be shown even for a tick.
+                det = prev[2] if prev and prev[1] == idx else {}
+                if idx is not None and (prev is None or prev[1] != idx
+                                        or t0 - prev[0] >= DETAIL_SEC):
                     try:
                         det = http_json(f"/{ih}/{idx}/stats.json", timeout=4)
-                        det_cache[ih] = (t0, det)
+                        det_cache[ih] = (t0, idx, det)
                     except Exception:
                         pass
                 wires = [w for w in (s.get("wires") or []) if w.get("address")]
@@ -1281,7 +1366,6 @@ def collect():
                         rq.put(ip)
 
                 speed = s.get("downloadSpeed") or 0
-                ph = PLAYHEAD.get(ih)
                 length = det.get("streamLen") or (files[idx]["length"] if idx is not None else 0)
                 progress = det.get("streamProgress")
 
@@ -1294,8 +1378,10 @@ def collect():
                 # ffprobe (the server's /probe 500s) and needs no duration metadata.
                 need = 0.0
                 if ph:
-                    n = NEEDS.setdefault(ih, {"prev_offset": ph["offset"],
-                                              "prev_at": ph["at"], "need": 0.0})
+                    n = NEEDS.get(ih)
+                    if not n or n["idx"] != idx:     # offsets in another file
+                        n = NEEDS[ih] = {"idx": idx, "prev_offset": ph["offset"],
+                                         "prev_at": ph["at"], "need": 0.0}
                     dt = ph["at"] - n["prev_at"]
                     do = ph["offset"] - n["prev_offset"]
                     if dt >= 20:
@@ -1303,13 +1389,19 @@ def collect():
                         n["prev_offset"], n["prev_at"] = ph["offset"], ph["at"]
                     need = n["need"]
 
-                name = det.get("streamName") or s.get("name") or ih
-                remember_name(ih, name)
+                name = (det.get("streamName")
+                        or (files[idx].get("name") if idx is not None else None)
+                        or s.get("name") or ih)
+                # A cache entry holds the whole torrent, so a season pack is filed
+                # under the pack's name, not whichever episode happened to be playing.
+                remember_name(ih, s.get("name") if len(files) > 1 else name)
                 engines[ih] = {
                     "infohash": ih,
                     "name": name,
                     "torrent": s.get("name") or "",
                     "idx": idx,
+                    "files": len(files),
+                    "file_known": known,
                     "len": length,
                     "progress": progress,
                     "downloaded": s.get("downloaded") or 0,
@@ -1332,21 +1424,20 @@ def collect():
                     "peer_spark": [h["peers"] for h in hist],
                 }
 
+            FILES_SEEN.set()
+
             # Fetched before a stop completed: stale for that engine, and showing it would
             # read as "re-opened".
             for ih in [k for k in engines if STOPPED.get(k, 0) > t0]:
                 engines.pop(ih)
 
-            clients, funnel = read_sockets()
-            total_ingest = sum(e["speed"] for e in engines.values())
+            socks, funnel = read_sockets()
+            clients = by_device(socks)
             with CFG_LOCK:
                 names = ACTIVE["client_names"]
             for c in clients:
                 c["name"] = names.get(c["ip"], "")
-                # Nothing arriving from peers while the client is consuming means the
-                # bytes are coming off the local cache, not the swarm.
-                c["from_cache"] = bool(c.get("active")) and total_ingest <= 0
-            demand = sum(c["delivered_bps"] for c in clients if c.get("active"))
+            demand = sum(c["delivered_bps"] for c in socks if c.get("active"))
             consumers = sum(1 for c in clients if c.get("active"))
             # A client socket carries no infohash, but the LOG does: the engine whose
             # playhead moved recently is the one being read. That beats the old
@@ -1358,7 +1449,7 @@ def collect():
                 list(engines)[0] if len(engines) == 1 else None)
             for ih, e in engines.items():
                 on = (ih == target)
-                e["cached"] = (e["progress"] or 0) >= 0.999
+                e["cached"] = e["file_known"] and (e["progress"] or 0) >= 0.999
                 e["being_read"] = ih in being_read
                 e["demand_bps"] = demand if on else 0
                 e["consumers"] = consumers if on else 0
@@ -1369,7 +1460,7 @@ def collect():
                 # reconnects, so the pair stays consistent. This over-estimates the
                 # true playhead by the player's own buffer, which errs toward warning
                 # early rather than late.
-                acked = sum(c["bytes_acked"] for c in clients if c.get("active"))
+                acked = sum(c["bytes_acked"] for c in socks if c.get("active"))
                 ph = e["playhead"]
                 consumed = (ph["offset"] + acked) if (on and ph and acked) else None
                 cached_bytes = (e["progress"] or 0) * (e["len"] or 0)
@@ -1390,9 +1481,21 @@ def collect():
                 since_stop = t0 - STOPPED.get(ih, -1e9)
                 e["reopened_after_stop"] = since_stop if since_stop < STOP_NOTE else None
                 last, delay = BITRATE_TRIED.get(key, (0.0, PROBE_RETRY_MIN))
-                if key not in BITRATE and since_stop >= STOP_QUIET and t0 - last >= delay:
+                # Opening a file makes Stremio download ALL of it, so only a file a
+                # client has already opened is probed. Probing the largest file of a
+                # season pack once pulled a whole episode that nobody watched.
+                if (e["file_known"] and key not in BITRATE and since_stop >= STOP_QUIET
+                        and t0 - last >= delay):
                     BITRATE_TRIED[key] = (t0, min(delay * 2, PROBE_RETRY_MAX) if last else delay)
                     pq.put(key)
+            # Only a file that is completely on disk is certainly being served from it.
+            # "No swarm ingest" is not enough: a client stalled on a file that is still
+            # downloading sees none either, and used to be reported as streaming from
+            # cache.
+            read = [engines[target]] if target else list(engines.values())
+            done = bool(read) and all(e["cached"] for e in read)
+            for c in clients:
+                c["from_cache"] = bool(c.get("active")) and done
             for ih in [k for k, t in STOPPED.items() if t0 - t >= STOP_NOTE]:
                 STOPPED.pop(ih, None)
             save_names()
@@ -1422,6 +1525,8 @@ def collect():
                     PLAYHEAD.pop(ih, None)
                     NEEDS.pop(ih, None)
                     det_cache.pop(ih, None)
+            for k in [k for k in FILE_LEN if k[0] not in engines]:
+                FILE_LEN.pop(k, None)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             with CFG_LOCK:

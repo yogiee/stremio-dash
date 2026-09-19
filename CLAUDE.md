@@ -16,7 +16,8 @@ Single-file Python collector (`app/stremio_dash.py`, stdlib only) + a single-fil
 
 1. **It is an observer. It must never sit in the media byte path.** If it dies, playback
    is unaffected. Never proxy stream bytes. Its only writes are the two user-requested
-   actions, stop and cache delete (ROADMAP Phase 6). It never POSTs `/settings`.
+   actions, stop and cache delete (ROADMAP Phase 6). It never POSTs `/settings`, and it
+   never opens a file no client opened: that makes Stremio download it.
 2. **Never commit `config.json` or `NOTES.homelab.md`** — real LAN addresses and device
    names. Before every commit: `git diff --cached | grep -nEi '192\.168\.|10\.[0-9]+\.|\.local|<your-domain>'`.
    A homelab-specific README once reached the staging area; the sweep caught it.
@@ -47,12 +48,18 @@ These were all established empirically against a live server. Re-deriving them i
 **Stremio API**
 - `wires[]` is populated *only while the swarm is active* — empty when paused, not absent.
 - `streamProgress` / `streamLen` exist **only** on the per-file endpoint, never the global one.
-  `streamLen == files[idx].length`, so the largest-file heuristic picks the right index.
+  `streamLen == files[idx].length`, but the largest file is the right index **only for a
+  single-file torrent**. In a season pack it is just the longest episode: the card once said
+  "fully cached" about E11 while E08 was stalling. The file being played comes from the log;
+  the largest is a fallback, labelled as a guess, for when no request has been seen.
 - `/probe?mediaURL=` returns **HTTP 500** on this build. Use `ffprobe` against the stream URL.
 - `uploadSpeed` is bogus — the server mirrors it from `downloadSpeed`. `uploaded` is real.
 - There is **no playback-position signal anywhere**: `selections` stays `[]`, and clients hold
   **one long-lived connection** rather than re-requesting. Position must be derived as
   `connection start offset + socket bytes_acked`; both reset together on reconnect.
+  That holds while data flows. A player **stalled** on a piece that is not there yet
+  re-requests the same offset every ~15 s on a new connection, and the server keeps the
+  old ones open.
 - **Engine lifecycle** (read from `server.js` 4.20.x):
   - An engine is destroyed **120 s after its last stream connection closes**.
   - Its swarm only pauses once the file is **fully cached**.
@@ -62,14 +69,26 @@ These were all established empirically against a live server. Re-deriving them i
   endpoint and no clear-cache endpoint.
 - **Any `GET /{ih}/{idx}` creates the engine**, including our own ffprobe. `stats.json`
   requests do not.
+- **Opening a file makes Stremio download all of it.** Probing the largest file of a season
+  pack pulled a whole 595 MB episode nobody watched, competing with the one being played.
+  Probe only a file a client has opened. Probe URLs carry `?stremio-dash=probe` so the
+  log tailer can tell them from players, backlog included.
 - The server closes an idle keep-alive connection after ~5 s. Our 2 s poll keeps ours open.
 - The Stremio log carries **no client IP**. Only the socket table knows who is connected.
 
 **Reading the log**
 - Range requests appear in **two shapes**: `-> GET /<ih>/<idx> bytes=N-` and
-  `... /<idx>? bytes=N-`. Match both or playhead tracking silently never fires.
-- Players read the **file tail** for metadata. A lone far-off request is not a seek —
-  require a second nearby request before believing the position moved.
+  `... /<idx>? bytes=N-`. Match both or playhead tracking silently never fires. The
+  Stremio apps send `?tr=…`; the only bare requests seen so far were curl and our ffprobe.
+- The path carries the **file index**, and a season pack switches files inside one engine.
+  Believe a switch after **two** requests on the new file (opening sends several at once);
+  a lone one must not move the card, because nothing may ever re-request the real file.
+- Players open a file with a **burst**: header, the index at the file's **end** (often as a
+  *pair* of requests), then **one** open-ended request from the resume point, held as a
+  single connection. A bounded range (`bytes=N-M`) or a read of the last
+  `max(16 MiB, 0.5%)` is never the position; the last request that is neither is. The old
+  rule, "believe a far jump only after a second nearby request", got both wrong: it took
+  the paired tail reads and dropped the lone resume request, parking the playhead at 99.9%.
 - Tail with `-t` and a backlog (`--tail 3000`) so a restart mid-stream keeps the start offset;
   without timestamps a replayed backlog looks like it just happened.
 
@@ -85,10 +104,15 @@ These were all established empirically against a live server. Re-deriving them i
   via `docker inspect`; it differs per host.
 - Poll over **one keep-alive connection**. A fresh connection per poll left ~90 TIME-WAIT
   sockets in the container's table, polluting the very client list being reported.
+- One device can hold **several sockets** (stalled re-requests, a leaked old connection).
+  The Clients table is one row per address; the engine maths (demand, playback position)
+  stays per socket.
 
 **Interpreting it**
 - **"No swarm traffic" ≠ "not playing."** A fully cached title is served from disk with zero
   peers. Distinguish, or a happily-playing client reads as paused.
+- **Nor does it mean "served from cache".** A client stalled on a file that is still
+  downloading sees zero ingest too. Say "from cache" only when the file being read is complete.
 - The `needs X` figure must come from **ffprobe**, never the client's delivered rate — for an
   uncached title the client can only receive as fast as the swarm supplies, so it would always
   read "keeping up" precisely while buffering.

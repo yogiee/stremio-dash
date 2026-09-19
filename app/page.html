@@ -348,10 +348,11 @@ function updateCard(e){
   r.badges.innerHTML=(e.reopened_after_stop!=null
       ?`<span class="b pz" title="Stopped ${dur(e.reopened_after_stop)} ago, and a client asked for it again">re-opened</span>`:'')+
     (e.searching?'<span class="b sr">peer search</span>':'')+
-    (serving&&!active?'<span class="b on">from cache</span>'
+    (serving&&!active?(e.cached?'<span class="b on">from cache</span>':'<span class="b pz">no ingest</span>')
       :(active?'<span class="b on">active</span>'
           :(e.paused?'<span class="b pz">swarm paused</span>':'<span class="b off">idle</span>')));
-  r.meta.innerHTML=`${B(e.len)} &middot; ${(prog*100).toFixed(1)}% cached &middot; ${B(e.downloaded)} downloaded`
+  r.meta.innerHTML=(e.files>1?`${e.file_known?'one':'largest'} of ${e.files} files &middot; `:'')
+    +`${B(e.len)} &middot; ${(prog*100).toFixed(1)}% cached &middot; ${B(e.downloaded)} downloaded`
     +(e.required_bps?` &middot; needs ${S(e.required_bps)}`:'')
     +(phPct!=null?` &middot; <span style="color:var(--pur)">playhead ${phPct.toFixed(1)}%</span>`:'')
     +(ph&&ph.seeks?` &middot; ${ph.seeks} seek${ph.seeks>1?'s':''}`:'')
@@ -373,7 +374,14 @@ function updateCard(e){
   // delivered rate, which is circular for an uncached title (it can only receive as
   // fast as the swarm supplies, so it would always read "keeping up" while buffering).
   const need=e.required_bps||0;
-  if(e.cached && e.consumers>0){
+  if(!e.file_known){
+    // A season pack with no request seen yet: the figures are for its largest file,
+    // which is only a guess at what is playing. Never let a guess read as "cached".
+    r.verdict.innerHTML=`<div class="verdict ${serving?'v-warn':'v-idle'}">This torrent holds
+      <b>${e.files}</b> files and no request for any of them has been seen${(LAST||{}).mode==='A'
+      ?' (the server log is not reachable in mode A)':''}, so which one is playing is unknown.
+      The figures above are for the largest file, not necessarily the one being watched.</div>`;
+  } else if(e.cached && e.consumers>0){
     r.verdict.innerHTML=`<div class="verdict v-ok">Fully cached &mdash; served from disk at
       <b>${S(e.demand_bps)}</b> to ${e.consumers} client${e.consumers>1?'s':''}. No peers needed;
       the swarm numbers below are just the engine holding its position.</div>`;
@@ -384,7 +392,7 @@ function updateCard(e){
   } else if(e.cached){
     r.verdict.innerHTML='<div class="verdict v-idle">Fully cached and nobody is reading it. '
       +'Swarm is idle.</div>';
-  } else if(need>0 && (active||e.being_read)){
+  } else if(need>0 && (active||e.being_read||serving)){
     const head=e.speed-need, rw=e.runway_secs, buf=e.buffered_secs;
     const lead=`Playback needs <b>${S(need)}</b>, swarm delivers <b>${S(e.speed)}</b>`;
     const banked=buf?` &middot; <b>${dur(buf)}</b> banked ahead of the playhead`:'';
@@ -417,6 +425,10 @@ function updateCard(e){
   } else if(active){
     r.verdict.innerHTML=`<div class="verdict v-ok">Downloading at <b>${S(e.speed)}</b>. Playback rate
       not measurable yet &mdash; needs ~30s of the player advancing through the file.</div>`;
+  } else if(serving){
+    r.verdict.innerHTML=`<div class="verdict v-warn">A client is reading this file, but nothing is
+      arriving from peers and only <b>${(prog*100).toFixed(1)}%</b> of it is on disk. Playback stalls
+      when it reaches a part that is not.</div>`;
   } else {
     r.verdict.innerHTML='<div class="verdict v-idle">Idle &mdash; no bytes moving. Peer counts above are '
       +'the engine holding its swarm open.</div>';
@@ -485,7 +497,8 @@ async function tick(){
       <tr><th>Client</th><th>Address</th><th class="sm-hide">Port</th><th class="r">Delivered <span class="mut">avg</span></th>
       <th class="r">Total sent</th><th class="r sm-hide">RTT</th><th>State</th></tr>`+
     d.clients.map(c=>`<tr>
-      <td>${esc(c.name||'—')}</td><td class="num">${esc(c.ip)}</td>
+      <td>${esc(c.name||'—')}</td><td class="num">${esc(c.ip)}${c.conns>1
+        ?` <span class="mut" title="${c.conns} connections from this address, shown as one client">&times;${c.conns}</span>`:''}</td>
       <td class="num mut sm-hide">${c.via}</td>
       <td class="r num">${S(c.delivered_bps)}</td>
       <td class="r num mut">${B(c.bytes_acked)}</td>

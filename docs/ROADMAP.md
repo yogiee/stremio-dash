@@ -2,8 +2,8 @@
 
 Status: **working and in daily use as a container**, with multi-server switching, stop and
 cache management. Released as `ghcr.io/yogiee/stremio-dash` (v0.1.0 packaging, v0.2.0
-control actions). The systemd path still works and is documented; the maintainer's own
-deployment has moved to the container.
+control actions, v0.2.1 season-pack accuracy). The systemd path still works and is
+documented; the maintainer's own deployment has moved to the container.
 
 ## Settled decisions
 
@@ -133,6 +133,25 @@ flag healthy playback.
 Background: Stremio destroys an engine 120 s after its last stream connection closes, and
 only pauses its swarm once the file is fully cached. So a switched-away stream keeps
 downloading for two minutes by design, longer if the player leaks the connection.
+
+## Season packs — reporting the right episode  *(done 2026-09-19, released in v0.2.1)*
+
+Found live: E08 of a 13-episode pack stalled while the card reported E11 "fully cached",
+because the card always showed the pack's largest file. Tracing it turned up four more
+faults in the same path:
+
+- **The dashboard downloaded episodes nobody watched.** Its ffprobe opened the largest file,
+  and opening a file makes Stremio fetch all of it: 595 MB, while E01 was playing. Only a
+  file a client opened is probed now, and probe URLs carry `?stremio-dash=probe`.
+- **The playhead's file never changed** after an engine's first request, so moving to the
+  next episode in a pack kept the old index.
+- **The position rule was backwards for this player.** It accepted the paired end-of-file
+  index reads and dropped the lone resume request, parking the playhead at 99.9%.
+- **"Streaming from cache" meant only "no ingest"**, which a stalled client shows too.
+
+Also: the Clients table groups sockets by address, since a stalled player opens a new
+connection every ~15 s. Verified against the live server in modes C and A, and by replaying
+its full log for the pack through the new tailer.
 
 ## Out of scope
 
