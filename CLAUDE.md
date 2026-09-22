@@ -126,6 +126,11 @@ These were all established empirically against a live server. Re-deriving them i
   usage — except busybox (in the container), which rejects `-B1`; there use `du -sk`.
 - Stremio leaves an empty infohash directory behind on eviction, so most cache entries are
   stubs. Count only directories holding data.
+- **Stremio's eviction counts apparent size.** Cache files are sparse at full length, so a
+  partial 20 GB title with 1.6 GB on disk counts as 20 GB against `cacheSize`. Every
+  `/settings` POST runs a resize 10 s later: *raising* a cap from 2 to 10 GB deleted the only
+  cached title (`from 20328MB`) while `du` said 1.6 GB. Our cache figure is real bytes, so it
+  understates what Stremio compares against the cap.
 
 **Control actions**
 - Every POST must be `Content-Type: application/json`. That is the CSRF guard, since there
