@@ -1,7 +1,9 @@
 # stremio-dash
 
-## Stack
-python, javascript, docker, systemd, self-hosted
+## Project
+Name: StremioDashboard
+Description: A live dashboard for a self-hosted Stremio streaming server that shows what the Stremio apps don't (engines, peers, swarm speed, playback position, connected clients) by observing its API, logs and socket table, with stop-stream and cache-delete controls.
+Stack: python, javascript, html, docker, systemd, ffmpeg, stremio, self-hosted
 
 ## What this is
 
